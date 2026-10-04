@@ -1,0 +1,10 @@
+--- a/drivers/video/fbdev/Kconfig
++++ b/drivers/video/fbdev/Kconfig
+@@ -7,6 +7,7 @@ menuconfig FB
+ 	tristate "Support for frame buffer device drivers"
+ 	select FB_CORE
+ 	select FB_NOTIFY
++	select FB_DMAMEM_HELPERS
+ 	help
+ 	  The frame buffer device provides an abstraction for the graphics
+ 	  hardware. It represents the frame buffer of some video hardware and

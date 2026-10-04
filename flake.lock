@@ -1,0 +1,44 @@
+{
+  "nodes": {
+    "fiptool": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1730769376,
+        "narHash": "sha256-zpWvmPrRH+Z/Xjw0JpXpeqle2kkS6IE3nt1CJoiekk8=",
+        "owner": "sophgo",
+        "repo": "fiptool",
+        "rev": "7f59889c91f7d5d440d6a09aad0209f0aca3d09d",
+        "type": "github"
+      },
+      "original": {
+        "owner": "sophgo",
+        "repo": "fiptool",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1781577229,
+        "narHash": "sha256-lrp67w8AulE9Ks53n27I45ADSzbOCn4H+CNW1Ck8B+8=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "567a49d1913ce81ac6e9582e3553dd90a955875f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "type": "github",
+        "ref": "nixos-unstable"
+      }
+    },
+    "root": {
+      "inputs": {
+        "fiptool": "fiptool",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

@@ -1,0 +1,14 @@
+/result
+/result-*
+/configuration.local.nix
+/.agents/
+/.codex/
+/.aws/
+/.ssh/
+/.env
+/.env.*
+*.pem
+*.key
+*.img
+*.img.zst
+*.log

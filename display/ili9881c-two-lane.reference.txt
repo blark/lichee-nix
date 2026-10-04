@@ -1,0 +1,5 @@
+# Lane-control reference ONLY: not a complete panel initialization sequence.
+# Insert these writes in the actual panel sequence with page 1 selected.
+ff 98 81 01
+b7 03
+ff 98 81 00
