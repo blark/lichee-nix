@@ -1,0 +1,130 @@
+--- a/src/emu/x86syscall_32.c
++++ b/src/emu/x86syscall_32.c
+@@ -662,6 +662,113 @@
+     uint32_t  stack_from_context;
+ } clone_t;
+ 
++#if defined(RV64) && defined(__GLIBC__)
++// A CLONE_VM process without CLONE_SETTLS inherits its creator's host TP.
++// pthread_setspecific/errno/tcache would then be shared with the parent. Use
++// a parked native pthread to own initialized host TLS for the child's lifetime.
++// Guest execution still uses a real separate-PID clone, never CLONE_THREAD.
++// The provider waits with raw futex syscalls, touching no libc TLS while the
++// child is alive. Kernel CHILD_CLEARTID releases it after userspace has stopped.
++typedef struct clone_tls32_s {
++    x64emu_t* emu;
++    void* stack;
++    uint32_t flags;
++    uint32_t ready, alive, references;
++    int result, error;
++    uint64_t signal_mask;
++} clone_tls32_t;
++static long clone_futex32(uint32_t* word, int op, uint32_t value)
++{
++    register long a0 __asm__("a0")=(long)word;
++    register long a1 __asm__("a1")=op;
++    register long a2 __asm__("a2")=value;
++    register long a3 __asm__("a3")=0;
++    register long a4 __asm__("a4")=0;
++    register long a5 __asm__("a5")=0;
++    register long a7 __asm__("a7")=__NR_futex;
++    __asm__ volatile("ecall":"+r"(a0):"r"(a1),"r"(a2),"r"(a3),"r"(a4),"r"(a5),"r"(a7):"memory");
++    return a0;
++}
++static void clone_tls_release32(clone_tls32_t* job)
++{
++    if(__atomic_sub_fetch(&job->references,1,__ATOMIC_ACQ_REL)==0) box_free(job);
++}
++static int clone_tls_child32(void* opaque)
++{
++    clone_tls32_t* job=opaque;
++    x64emu_t* emu=job->emu;
++    thread_set_emu(emu); // this child has the provider's independent host TLS
++    R_EAX=0;
++    syscall(__NR_rt_sigprocmask,SIG_SETMASK,&job->signal_mask,NULL,8);
++    DynaRun(emu);
++    _exit(S_EAX); // separate host PID, so exit_group ends only this guest process
++}
++static void* clone_tls_provider32(void* opaque)
++{
++    clone_tls32_t* job=opaque;
++    // The parked provider is part of the parent's thread group. It must never
++    // catch parent-directed signals with the child's shared emulator TLS.
++    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE,NULL);
++    uint64_t all=UINT64_MAX;
++    syscall(__NR_rt_sigprocmask,SIG_BLOCK,&all,NULL,8);
++    void* tp=__builtin_thread_pointer();
++    int flags=(job->flags&~(CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID))
++        | CLONE_SETTLS | CLONE_CHILD_CLEARTID;
++    int result=clone(clone_tls_child32,(char*)job->stack+1024*1024,
++                     flags,job,NULL,tp,&job->alive);
++    job->result=result;
++    job->error=result==-1?errno:0;
++    __atomic_store_n(&job->ready,1,__ATOMIC_RELEASE);
++    clone_futex32(&job->ready,FUTEX_WAKE,1);
++    if(result!=-1) {
++        while(__atomic_load_n(&job->alive,__ATOMIC_ACQUIRE))
++            clone_futex32(&job->alive,FUTEX_WAIT,1);
++        // The shared provider TLS now contains the child's emulator metadata.
++        // It is safe to release it only after the kernel cleared alive.
++        thread_set_emu(NULL);
++    } else {
++        FreeX64Emu(&job->emu);
++    }
++    munmap(job->stack,1024*1024);
++    clone_tls_release32(job);
++    return NULL;
++}
++static int clone_with_tls32(x64emu_t* emu, uint32_t flags, uint32_t stack)
++{
++    clone_tls32_t* job=box_calloc(1,sizeof(*job));
++    if(!job) { errno=ENOMEM; return -1; }
++    job->emu=NewX64Emu(emu->context,R_EIP,stack,0,0);
++    SetupX64Emu(job->emu,emu);
++    CloneEmu(job->emu,emu);
++    job->emu->regs[_SP].q[0]=stack;
++    job->flags=flags;
++    syscall(__NR_rt_sigprocmask,SIG_SETMASK,NULL,&job->signal_mask,8);
++    job->alive=1; job->references=2;
++    job->stack=mmap(NULL,1024*1024,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
++    if(job->stack==MAP_FAILED) {
++        int error=errno; FreeX64Emu(&job->emu); box_free(job); errno=error; return -1;
++    }
++    pthread_attr_t attr;
++    pthread_attr_init(&attr);
++    pthread_attr_setdetachstate(&attr,PTHREAD_CREATE_DETACHED);
++    pthread_attr_setstacksize(&attr,64*1024);
++    pthread_t provider;
++    int error=pthread_create(&provider,&attr,clone_tls_provider32,job);
++    pthread_attr_destroy(&attr);
++    if(error) {
++        munmap(job->stack,1024*1024); FreeX64Emu(&job->emu); box_free(job);
++        errno=error; return -1;
++    }
++    while(!__atomic_load_n(&job->ready,__ATOMIC_ACQUIRE))
++        clone_futex32(&job->ready,FUTEX_WAIT,0);
++    int result=job->result;
++    error=job->error;
++    clone_tls_release32(job);
++    errno=error;
++    return result;
++}
++#endif
++
+ static int clone32_fn(void* arg)
+ {
+     clone_t* args = arg;
+@@ -852,6 +959,13 @@
+                 S_EAX = -errno;
+             break;
+         case 120: // sys_clone
++#if defined(RV64) && defined(__GLIBC__)
++            if(R_ECX && (R_EBX&CLONE_VM) && !(R_EBX&(CLONE_THREAD|CLONE_VFORK|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID))) {
++                S_EAX=clone_with_tls32(emu,R_EBX,R_ECX);
++                if(S_EAX==-1) S_EAX=-errno;
++                break;
++            }
++#endif
+             // x86 raw syscall is long clone(unsigned long flags, void *stack, int *parent_tid, unsigned long tls, int *child_tid);
+             // so flags=R_EBX, stack=R_ECX, parent_tid=R_EDX, child_tid=R_ESI, tls=R_EDI
+             if((R_EBX&~0xff)==0x4100) {

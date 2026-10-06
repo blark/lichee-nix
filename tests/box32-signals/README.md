@@ -1,4 +1,4 @@
-This is a native-reference instrument for the unfinished raw-i386 signal path.
+This is a native-reference instrument for the experimental raw-i386 signal path.
 It installs signals32–34 through rt_sigaction174, with SA_SIGINFO clear and
 SA_RESTORER set. Its restorer pops the signal number then invokes sigreturn119.
 No libc, game libraries or proprietary files are used.
@@ -20,7 +20,10 @@ The positive probe checks:
 
 - Pending signals remain blocked until rt_sigsuspend atomically unmasks them.
 - Each initial signal runs exactly once and returns EINTR; the mask is restored.
-- Carry, integer registers, x87 value and XMM state survive handler clobbering.
+- Full blocking masks, full sa_mask and a full edited saved mask are accepted;
+  restored bits for the supported signal set are checked.
+- Carry, integer registers, x87 values and XMM state survive handler clobbering,
+  including an exact 80-bit value not representable as a double.
 - Signal33 actually enters at depth2 inside32, using the outer handler's saved
   stack and a mask containing automatically blocked32. Outer integer/FP state
   is checked immediately after nested return, and final depth must be zero.
@@ -28,10 +31,10 @@ The positive probe checks:
 - A child created with VM|FS|FILES|SIGHAND, without CLONE_THREAD or an exit
   signal, uses kill(parent_pid,32). Its parent PID and __WCLONE wait are checked.
 
-Copy the positive executable to the board and invoke an explicit Box32 binary
-under timeout. Current Box32 fails with ENOSYS at174, exit1. This is fail-before
-evidence; no patched signal implementation or pass-after exists yet.
-A future implementation must pass this entire instrument, not just174.
+Copy all three executables to the board and invoke an explicit Box32 binary
+under timeout. The original board build fails at174, exit1. The seven-patch
+RV64 build passes the whole positive instrument and fails both broken controls
+with the native reference exit codes (0/1/139). Consult AUDIT.md for scope limits.
 Preservation of the translator's native reserved32/33 needs a separate host-side
 check: this fixture measures the guest-visible signal contract only.
 

@@ -1,0 +1,381 @@
+--- a/src/emu/x86syscall_32.c
++++ b/src/emu/x86syscall_32.c
+@@ -12,7 +12,13 @@
+ #include <sys/select.h>
+ #include <sys/types.h>
+ #include <sys/ioctl.h>
+-#include <asm/stat.h>
++#include <sys/stat.h>
++#include <sys/sysmacros.h>
++#include <sys/time.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <sys/uio.h>
++#include <sys/shm.h>
+ #include <errno.h>
+ #include <sched.h>
+ #include <sys/wait.h>
+@@ -67,7 +73,7 @@
+     //{ 15, __NR_chmod, 2 },
+     //{ 19, __NR_lseek, 3 },
+     { 20, __NR_getpid, 0 },
+-    //{ 24, __NR_getuid, 0 },
++
+     //{ 33, __NR_access, 2 },
+     //{ 37, __NR_kill, 2 },
+     //{ 38, __NR_rename, 2 },
+@@ -78,9 +84,9 @@
+     { 42, __NR_pipe, 1 },
+     #endif
+     //{ 45, __NR_brk, 1 },
+-    //{ 47, __NR_getgid, 0 },
+-    //{ 49, __NR_geteuid, 0 },
+-    //{ 50, __NR_getegid, 0 },
++
++
++
+     //{ 54, __NR_ioctl, 3 },    // should be wrapped to allow SA_RESTART handling by libc, but syscall is only 3 arguments, ioctl can be 5
+     //{ 55, __NR_fcntl, 3 },    // wrapped to allow filter of F_SETFD
+     //{ 60, __NR_umask, 1 },
+@@ -124,7 +130,7 @@
+     //{ 144, __NR_msync, 3 },
+     //{ 145, __NR_readv, 3 },
+     //{ 146, __NR_writev, 3 },
+-    //{ 148, __NR_fdatasync, 1 },
++    { 148, __NR_fdatasync, 1 },
+     //{ 149, __NR__sysctl, 1 },    // need wrapping?
+     //{ 156, __NR_sched_setscheduler, 3 },
+     //{ 157, __NR_sched_getscheduler, 1 },
+@@ -132,6 +138,8 @@
+     //{ 162, __NR_nanosleep, 2 },
+     //{ 164, __NR_setresuid, 3 },
+     //{ 168, __NR_poll, 3 },    // wrapped to allow SA_RESTART wrapping by libc
++    { 152, __NR_mlockall, 1 },
++    { 153, __NR_munlockall, 0 },
+     { 172, __NR_prctl, 5 },
+     //{ 173, __NR_rt_sigreturn, 0 },
+     //{ 175, __NR_rt_sigprocmask, 4 },
+@@ -145,15 +153,15 @@
+     //{ 195, __NR_stat64, 2 },  // need proprer wrap because of structure size change
+     //{ 196, __NR_lstat64, 2 }, // need proprer wrap because of structure size change
+     //{ 197, __NR_fstat64, 2 },  // need proprer wrap because of structure size change
+-    //{ 199, __NR_getuid32, 0 },
+-    //{ 200, __NR_getgid32, 0 },
+-    //{ 201, __NR_geteuid32, 0 },
+-    //{ 202, __NR_getegid32, 0 },
++    { 199, __NR_getuid, 0 },
++    { 200, __NR_getgid, 0 },
++    { 201, __NR_geteuid, 0 },
++    { 202, __NR_getegid, 0 },
+     //{ 208, __NR_setresuid32, 3 },
+     //{ 209, __NR_getresuid32, 3 },
+     //{ 210, __NR_setresgid32, 3 },
+     //{ 211, __NR_getresgid32, 3 },
+-    //{ 220, __NR_getdents64, 3 },
++    { 220, __NR_getdents64, 3 },
+     //{ 221, __NR_fcntl64, 3 },
+     { 224, __NR_gettid, 0 },
+     //{ 240, __NR_futex, 6 },   // needs wrapping for the optionnal timespec part
+@@ -367,6 +375,280 @@
+ int my32_raw_sigprocmask(x64emu_t* emu, int how, uint32_t set, uint32_t old, int size);
+ int32_t my32_raw_sigsuspend(x64emu_t* emu, uint32_t set, int size);
+ int my32_raw_kill(x64emu_t* emu, int pid, int sig);
++// Kernel stat(106) is not libc's version-3 stat structure (64 vs 88 bytes).
++typedef struct kernel_stat32_s {
++    uint32_t dev, ino;
++    uint16_t mode, nlink, uid, gid;
++    uint32_t rdev, size, blksize, blocks;
++    uint32_t atime, atime_nsec, mtime, mtime_nsec, ctime, ctime_nsec;
++    uint32_t unused[2];
++} kernel_stat32_t;
++_Static_assert(sizeof(kernel_stat32_t)==64, "i386 kernel stat size");
++_Static_assert(sizeof(struct i386_stat64)==96, "i386 kernel stat64 size");
++
++static uint32_t kernel_device32(dev_t dev)
++{
++    return (minor(dev)&255) | (major(dev)<<8) | ((minor(dev)&~255U)<<12);
++}
++
++static int ordinary_stat32(int call, uint32_t path_or_fd, uint32_t output)
++{
++    struct stat64 st;
++    // Fetch to native storage first: never copy uninitialized data on failure.
++    int r = call==197 ? fstat64((int)path_or_fd, &st)
++                      : stat64(from_ptrv(path_or_fd), &st);
++    if(r) return r;
++    size_t size = call==106 ? sizeof(kernel_stat32_t) : sizeof(struct i386_stat64);
++    if(!startup_access32(output, size, PROT_WRITE)) { errno=EFAULT; return -1; }
++    if(call==106) {
++        if(st.st_ino>UINT32_MAX || st.st_nlink>UINT16_MAX || st.st_size>INT32_MAX ||
++           st.st_size<0 || st.st_blocks>UINT32_MAX || major(st.st_dev)>4095 ||
++           major(st.st_rdev)>4095 || minor(st.st_dev)>1048575 || minor(st.st_rdev)>1048575) {
++            errno=EOVERFLOW; return -1;
++        }
++        kernel_stat32_t guest = {
++            .dev=kernel_device32(st.st_dev), .ino=st.st_ino,
++            .mode=st.st_mode, .nlink=st.st_nlink,
++            .uid=st.st_uid>65535?65534:st.st_uid,
++            .gid=st.st_gid>65535?65534:st.st_gid,
++            .rdev=kernel_device32(st.st_rdev), .size=st.st_size,
++            .blksize=st.st_blksize, .blocks=st.st_blocks,
++            .atime=st.st_atim.tv_sec, .atime_nsec=st.st_atim.tv_nsec,
++            .mtime=st.st_mtim.tv_sec, .mtime_nsec=st.st_mtim.tv_nsec,
++            .ctime=st.st_ctim.tv_sec, .ctime_nsec=st.st_ctim.tv_nsec,
++        };
++        memcpy(from_ptrv(output), &guest, sizeof(guest));
++    } else {
++        struct i386_stat64 guest = {0};
++        UnalignStat64_32(&st, &guest);
++        guest.st_dev=kernel_device32(st.st_dev);
++        guest.st_rdev=kernel_device32(st.st_rdev);
++        memcpy(from_ptrv(output), &guest, sizeof(guest));
++    }
++    return 0;
++}
++
++static int ordinary_gettimeofday32(uint32_t tv, uint32_t tz)
++{
++    if((tv && !startup_access32(tv, 8, PROT_WRITE)) ||
++       (tz && !startup_access32(tz, 8, PROT_WRITE))) { errno=EFAULT; return -1; }
++    struct timeval now;
++    struct timezone zone;
++    int r=gettimeofday(tv?&now:NULL, tz?&zone:NULL);
++    if(r) return r;
++    if(tv) {
++        int32_t guest[2]={now.tv_sec, now.tv_usec};
++        memcpy(from_ptrv(tv), guest, sizeof(guest));
++    }
++    if(tz) memcpy(from_ptrv(tz), &zone, 8);
++    return 0;
++}
++
++// Use the existing flag converters, but do not depend on wrapped libc having
++// been initialized. In particular my32_fcntl64 returns a fake 0 without my_lib.
++static int ordinary_fcntl32(int fd, int cmd, uint32_t arg)
++{
++    if(cmd==5 || cmd==6 || cmd==7 || cmd==12 || cmd==13 || cmd==14) {
++        int wide=cmd>=12;
++        size_t size=wide?sizeof(x86_flock64_t):sizeof(i386_flock_t);
++        if(!startup_access32(arg, size, PROT_READ | ((cmd==5 || cmd==12)?PROT_WRITE:0))) {
++            errno=EFAULT; return -1;
++        }
++        struct flock native = {0};
++        if(wide) AlignFlock64_32(&native, from_ptrv(arg));
++        else AlignFlock_32(&native, from_ptrv(arg));
++        int r=fcntl(fd, wide?cmd-7:cmd, &native);
++        if(!r && (cmd==5 || cmd==12)) {
++            if(!wide && (native.l_start>INT32_MAX || native.l_start<INT32_MIN ||
++                         native.l_len>INT32_MAX || native.l_len<INT32_MIN)) {
++                errno=EOVERFLOW; return -1;
++            }
++            if(wide) UnalignFlock64_32(from_ptrv(arg), &native);
++            else UnalignFlock_32(from_ptrv(arg), &native);
++        }
++        return r;
++    }
++    int r=fcntl(fd, cmd, cmd==F_SETFL?of_convert32(arg):arg);
++    return cmd==F_GETFL && r!=-1 ? of_unconvert32(r) : r;
++}
++
++
++static int ordinary_nanosleep32(uint32_t req, uint32_t rem)
++{
++    if(!startup_access32(req,8,PROT_READ) || (rem && !startup_access32(rem,8,PROT_WRITE))) {
++        errno=EFAULT; return -1;
++    }
++    int32_t guest[2];
++    memcpy(guest,from_ptrv(req),8);
++    struct timespec native={guest[0],guest[1]}, left;
++    int r=nanosleep(&native, rem?&left:NULL);
++    if(r==-1 && errno==EINTR && rem) {
++        guest[0]=left.tv_sec; guest[1]=left.tv_nsec;
++        memcpy(from_ptrv(rem),guest,8);
++    }
++    return r;
++}
++static int ordinary_socketcall32(unsigned call, uint32_t args)
++{
++    static const uint8_t counts[]={0,3,3,3,2,3,3,3,4,4,4,6,6,2,5,5};
++    if(!call || call>=sizeof(counts)) { errno=ENOSYS; return -1; }
++    if(!startup_access32(args,counts[call]*4,PROT_READ)) { errno=EFAULT; return -1; }
++    uint32_t v[6]={0}; memcpy(v,from_ptrv(args),counts[call]*4);
++    switch(call) {
++        case 1: return socket(v[0],v[1],v[2]);
++        case 2: return bind(v[0],from_ptrv(v[1]),v[2]);
++        case 3: return connect(v[0],from_ptrv(v[1]),v[2]);
++        case 4: return listen(v[0],v[1]);
++        case 5: return accept(v[0],from_ptrv(v[1]),from_ptrv(v[2]));
++        case 6: return getsockname(v[0],from_ptrv(v[1]),from_ptrv(v[2]));
++        case 7: return getpeername(v[0],from_ptrv(v[1]),from_ptrv(v[2]));
++        case 8: return socketpair(v[0],v[1],v[2],from_ptrv(v[3]));
++        case 9: return send(v[0],from_ptrv(v[1]),v[2],v[3]);
++        case 10: return recv(v[0],from_ptrv(v[1]),v[2],v[3]);
++        case 11: return sendto(v[0],from_ptrv(v[1]),v[2],v[3],from_ptrv(v[4]),v[5]);
++        case 12: return recvfrom(v[0],from_ptrv(v[1]),v[2],v[3],from_ptrv(v[4]),from_ptrv(v[5]));
++        case 13: return shutdown(v[0],v[1]);
++        case 14: return setsockopt(v[0],v[1],v[2],from_ptrv(v[3]),v[4]);
++        case 15: return getsockopt(v[0],v[1],v[2],from_ptrv(v[3]),from_ptrv(v[4]));
++    }
++    errno=ENOSYS; return -1;
++}
++void* my32_shmat(x64emu_t* emu, int id, void* addr, int flags);
++int my32_mprotect(x64emu_t* emu, void* addr, unsigned long len, int prot);
++void* my32_mremap(x64emu_t* emu, void* old, size_t oldsz, size_t newsz, int flags, void* newaddr);
++typedef struct shm_attach32_s {
++    void* addr;
++    size_t size;
++    struct shm_attach32_s* next;
++} shm_attach32_t;
++static shm_attach32_t* shm_attachments32;
++static pthread_mutex_t shm_attach_mutex32=PTHREAD_MUTEX_INITIALIZER;
++static int ordinary_ipc_impl32(x64emu_t* emu, uint32_t call, int first, uint32_t second, uint32_t third, uint32_t ptr)
++{
++    // i386 SysV IPC multiplexes its operation in the low 16 bits. SHMAT v0
++    // writes the resulting 32-bit address through its third argument.
++    if(call>>16) { errno=ENOSYS; return -1; }
++    switch(call) {
++        case 23: return shmget(first,second,third);
++        case 21: {
++            if(!startup_access32(third,4,PROT_WRITE)) { errno=EFAULT; return -1; }
++            void* addr=my32_shmat(emu,first,from_ptrv(ptr),second);
++            if(addr==(void*)-1) return -1;
++            if((uintptr_t)addr>=0xc0000000U) { shmdt(addr); errno=ENOMEM; return -1; }
++            struct shmid_ds ds;
++            if(shmctl(first,IPC_STAT,&ds)) { int error=errno; shmdt(addr); errno=error; return -1; }
++            shm_attach32_t* attachment=box_malloc(sizeof(*attachment));
++            if(!attachment) { shmdt(addr); errno=ENOMEM; return -1; }
++            attachment->addr=addr; attachment->size=ds.shm_segsz;
++            pthread_mutex_lock(&shm_attach_mutex32);
++            attachment->next=shm_attachments32; shm_attachments32=attachment;
++            setProtection_mmap((uintptr_t)addr,ds.shm_segsz,
++                second&SHM_RDONLY?PROT_READ:PROT_READ|PROT_WRITE);
++            pthread_mutex_unlock(&shm_attach_mutex32);
++            uint32_t guest=to_ptrv(addr);
++            memcpy(from_ptrv(third),&guest,4);
++            return 0;
++        }
++        case 22: {
++            pthread_mutex_lock(&shm_attach_mutex32);
++            int r=shmdt(from_ptrv(ptr));
++            int saved=errno;
++            if(!r) {
++                shm_attach32_t** entry=&shm_attachments32;
++                while(*entry && (*entry)->addr!=from_ptrv(ptr)) entry=&(*entry)->next;
++                if(*entry) {
++                    shm_attach32_t* old=*entry; *entry=old->next;
++                    freeProtection((uintptr_t)old->addr,old->size);
++                    box_free(old);
++                }
++            }
++            pthread_mutex_unlock(&shm_attach_mutex32);
++            errno=saved;
++            return r;
++        }
++        case 24:
++            // IPC_RMID has no structure to convert; other shmctl forms do.
++            if(second==IPC_RMID) return shmctl(first,IPC_RMID,NULL);
++            errno=ENOSYS; return -1;
++    }
++    errno=ENOSYS; return -1;
++}
++// The attachment mutex cannot be taken from an interrupt of its owner. Keep
++// native signals blocked only around this small, non-guest-code operation.
++static int ordinary_ipc32(x64emu_t* emu, uint32_t call, int first, uint32_t second, uint32_t third, uint32_t ptr)
++{
++    uint64_t all=UINT64_MAX, saved;
++    if(syscall(__NR_rt_sigprocmask,SIG_BLOCK,&all,&saved,8)) return -1;
++    int r=ordinary_ipc_impl32(emu,call,first,second,third,ptr);
++    int error=errno;
++    syscall(__NR_rt_sigprocmask,SIG_SETMASK,&saved,NULL,8);
++    errno=error;
++    return r;
++}
++int my32_ioctl(x64emu_t* emu, int fd, unsigned long op, void* arg);
++// Shared by raw int-0x80 and wrapped syscall(). Result is libc-style here;
++// only the raw caller converts -1/errno into a negative i386 errno.
++static int ordinary_syscall32(x64emu_t* emu, int call, uint32_t a, uint32_t b,
++                              uint32_t c, uint32_t d, uint32_t e, int32_t* result)
++{
++    switch(call) {
++        case 24: { uid_t id=getuid(); *result=id>65535?65534:id; break; }
++        case 47: { gid_t id=getgid(); *result=id>65535?65534:id; break; }
++        case 49: { uid_t id=geteuid(); *result=id>65535?65534:id; break; }
++        case 50: { gid_t id=getegid(); *result=id>65535?65534:id; break; }
++        case 9: *result=link(from_ptrv(a),from_ptrv(b)); break;
++        case 10: *result=unlink(from_ptrv(a)); break;
++        case 38: *result=rename(from_ptrv(a),from_ptrv(b)); break;
++        case 102: *result=ordinary_socketcall32(a,b); break;
++        case 117: *result=ordinary_ipc32(emu,a,b,c,d,e); break;
++        case 125: *result=my32_mprotect(emu,from_ptrv(a),b,c); break;
++        case 146: {
++            if(c>1024 || (c && !startup_access32(b,c*8,PROT_READ))) {
++                errno=c>1024?EINVAL:EFAULT; *result=-1; break;
++            }
++            struct iovec native[c?c:1];
++            for(uint32_t i=0;i<c;++i) {
++                uint32_t entry[2]; memcpy(entry,from_ptrv(b+i*8),8);
++                native[i].iov_base=from_ptrv(entry[0]); native[i].iov_len=entry[1];
++            }
++            *result=writev(a,native,c); break;
++        }
++        case 162: *result=ordinary_nanosleep32(a,b); break;
++        case 163: *result=to_ptrv(my32_mremap(emu,from_ptrv(a),b,c,d,from_ptrv(e))); break;
++        case 19: { // signed 32-bit off_t
++            off_t r=lseek((int)a, (int32_t)b, (int)c);
++            if(r>INT32_MAX) { errno=EOVERFLOW; r=-1; }
++            *result=r; break;
++        }
++        case 33: *result=access(from_ptrv(a), b); break;
++        case 39: *result=mkdir(from_ptrv(a), b); break;
++        case 40: *result=rmdir(from_ptrv(a)); break;
++        case 41: *result=dup((int)a); break;
++        case 54: *result=my32_ioctl(emu, (int)a, b, from_ptrv(c)); break;
++        case 55:
++        case 221: *result=ordinary_fcntl32((int)a, b, c); break;
++        case 78: *result=ordinary_gettimeofday32(a, b); break;
++        case 85: *result=readlink(from_ptrv(a), from_ptrv(b), c); break;
++        case 106:
++        case 195:
++        case 197: *result=ordinary_stat32(call, a, b); break;
++        case 140: { // high/low offset, result pointer, whence
++            int64_t offset=(int64_t)(((uint64_t)b<<32)|c);
++            off_t r=lseek((int)a, offset, (int)e);
++            *result=r==-1?-1:0;
++            if(r!=-1) {
++                if(!startup_access32(d, 8, PROT_WRITE)) { errno=EFAULT; *result=-1; break; }
++                memcpy(from_ptrv(d), &r, 8);
++            }
++            break;
++        }
++        case 168: // pollfd has identical fixed-width fields (8 bytes)
++            *result=poll(from_ptrv(a), b, (int)c); break;
++        default: return 0;
++    }
++    return 1;
++}
++
+ pid_t my_vfork(x64emu_t* emu);
+ uint32_t my_modify_ldt(x64emu_t* emu, int op, thread_area_32_t* td, int size);
+ 
+@@ -486,6 +768,11 @@
+             printf_log(LOG_DEBUG, " => 0x%x\n", R_EAX);
+             return;
+         }
++    }
++    int32_t ordinary_result;
++    if(ordinary_syscall32(emu, s, R_EBX, R_ECX, R_EDX, R_ESI, R_EDI, &ordinary_result)) {
++        S_EAX=ordinary_result==-1?-errno:ordinary_result;
++        return;
+     }
+     switch (s) {
+         case 1: // sys_exit
+@@ -783,6 +1070,9 @@
+             }
+         }
+     }
++    int32_t ordinary_result;
++    if(ordinary_syscall32(emu, s, u32(0), u32(4), u32(8), u32(12), u32(16), &ordinary_result))
++        return ordinary_result;
+     switch (s) {
+         case 1: // __NR_exit
+             emu->quit = 1;

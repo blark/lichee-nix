@@ -655,13 +655,13 @@ the good/bad libraries from distinct working directories with relative
 executable paths; the initial shared-cwd absolute-path check loaded the good
 DSO twice and was rejected. No upstream report has been filed.
 
-### Signal frame instrument saved for continuation
+### Signal frame instrument: historical checkpoint before 1832b30
 
 tests/box32-signals now supplies a no-libc native i386 reference. The positive
 probe passes; blocking nested33 deliberately fails1, and removing the119
 restorer's pop deliberately fails139. Current board Box32 fails the positive
-probe at unsupported174, exit1. There is still no signal implementation or
-pass-after. It verifies legacy frame offsets, blocked/pending RT32–34,
+probe at unsupported174, exit1. At that checkpoint there was no signal
+implementation or pass-after. It verifies legacy frame offsets, blocked/pending RT32–34,
 atomic suspend, genuine depth2 nesting, restored integer/flags/x87/XMM state,
 deliberately edited EAX/EBP, and delivery from a separate-PID0xf00 clone.
 The native frame preserves the sole high mask word at offset720 and finds
@@ -680,3 +680,111 @@ native masks through SigSetJmp(...,1), so its longjmp resume path also needs
 explicit consideration for guest-mask edits. The new native probe exercises
 these observable contracts. Exact implementation remains the next task;
 do not uncomment a native sigreturn passthrough or add fake success.
+
+
+### Raw i386 syscall and signal work resumed after 1832b30
+
+The earlier "no signal implementation" checkpoint describes the state before
+1832b30. That commit added signal code, but its game run exercised zero handlers.
+Independent source review found a kernel-versus-libc action-layout error,
+unconditional restorer invocation, an extra EmuCall exit-address push,
+uninitialized saved masks, incomplete FP/segment restoration and an invalid
+sigreturn interpreter transition. Installation without warnings was not proof
+that the frame worked. The full operational review is saved locally; no private
+addresses, host pins or guest content belong in this repository.
+
+The replacement raw path converts the kernel's fixed 20-byte rt_sigaction ABI
+explicitly. It builds the legacy frame at context/FP/high-mask offsets 8/96/720
+with one extra mask word, enters EmuRun on that stack without EmuCall/DynaCall,
+and finishes that inner interpreter at syscall119. It restores registers,
+segments, flags, FP and the mask in the host return context. The raw handler
+bypasses both wrapped dispatchers' saved-register epilogues. No host sigreturn
+passthrough and no second restorer call are used. Exact x87 80-bit cached values
+must survive unchanged; the instrument now checks a value not representable as
+a double, as well as the prior nesting/edited-register/separate-PID checks.
+
+Runtime findings during integration: the first new runner reached119 but then
+executed the restorer's following UD2 because the interpreter kept its local
+instruction pointer. Fix: honor restored RIP and stop at quit after int0x80.
+The next build passed initial RT32–34 cycles, masks, FP and nesting but lost the
+outer frame's edited EBP. A diagnostic measured EAX=0x13579bdf (correct) and
+EBP=0x456789ab (stale handler value). RV64's syscall helper reloads only C caller
+registers. Its int0x80 path now reloads remaining guest registers and flags too.
+These observations are specific failures, not a claim that all signal work
+has passed yet. Final runtime evidence is recorded below when available.
+
+Scope limits are explicit: raw SA_SIGINFO handlers return ENOTSUP; RT frames
+and syscall173 are not implemented. Guest32/33 map to native63/64 to preserve
+the translator's native32/33 handlers; guest63/64 return EINVAL instead of
+aliasing independently queued signals. All masks, installation, sending and
+legacy return use that mapping. Shared action snapshots/installation use a
+futex gate with native signals blocked before acquisition and restored only
+after release; the gate is never held while executing guest code. This path
+is experimental and is not ready to propose as a general upstream signal fix.
+
+Ordinary raw syscalls now cover the original 15-call checklist, using libc
+wrappers on hosts without old syscall numbers and explicit kernel stat/time/
+lock converters. A libc-free instrument passes natively and the first ordinary
+board build passes all original stages; the previous build fails at stage1.
+_llseek was corrected after review to perform the seek before copying the
+result, preserving Linux EBADF precedence and position changes on EFAULT.
+The lseek32 overflow model is a native32 kernel's behavior, which differs from
+some x86_64 compat truncation behavior; the 64-bit _llseek fixture avoids that
+ambiguity. Broad ioctl compatibility remains the existing wrapper's scope.
+
+A bounded game retry cleared those15 warnings but exposed additional raw-path
+gaps. The measured inventory therefore was cross-checked beyond the initial
+list: IDs, link/unlink/rename, mprotect/mremap, nanosleep, writev, getdents64,
+fdatasync, mlockall/munlockall, socketcall102 and SysV IPC117 are now dispatched.
+Socketcall covers operations1–15; structure-bearing sendmsg/recvmsg are not
+implemented. IPC covers SHMGET23/SHMAT21/SHMDT22 and structure-free IPC_RMID24;
+other IPC control structures remain ENOSYS. Shared attachments register and
+remove the same tracked protection range. The expanded native instrument also
+checks sockets and detached-memory EFAULT. ioperm101, iopl110 and _sysctl149
+remain honestly unserved. No upstream issue or PR has been published.
+
+### Signal and separate-PID clone conformance measured on RV64
+
+The seven-patch build passes the entire libc-free signal instrument: RT32–34,
+blocked/pending delivery and atomic suspend, depth-two nesting, edited EAX/EBP,
+exact 80-bit x87 state, XMM state, and delivery from a separate-PID CLONE_VM
+child. Both deliberately broken controls retain their native outcomes: nested
+signal blocked exits1, malformed restorer exits139. The ordinary instrument
+passes all nine stages, and brk/startup/select regressions also pass. This is
+synthetic conformance, not a game or gameplay pass.
+
+The separate-PID test first exposed another upstream clone defect. Without
+host CLONE_SETTLS, the child inherits the parent's native thread pointer;
+thread_set_emu then overwrites the parent's TLS emulator key. A parent-directed
+signal consequently runs on the child emulator, followed by invalid emulator
+cleanup. Merely accepting the clone flags and returning a PID had not tested
+this contract.
+
+The narrowed RV64/glibc correction uses a dormant native pthread to own an
+initialized host TLS allocation for the lifetime of a real separate-PID clone.
+The child uses that allocation through native CLONE_SETTLS; its guest flags
+still omit CLONE_THREAD. The provider blocks signals, disables cancellation
+and parks through a raw futex until kernel CHILD_CLEARTID proves the child has
+stopped. Child metadata, emulator and stack are released afterwards. Guest
+parent PID and __WCLONE wait behavior pass the instrument. This avoids copying
+private glibc TCB layouts, but does not establish arbitrary native pthread
+identity, cancellation, robust-mutex or fork semantics. Each live guest child
+also costs a parked native thread. Guest SETTLS/TID and vfork/thread-group
+clone variants are outside this correction's scope.
+
+A bounded fully emulated application retry still reaches no X11 connection.
+Its manager child faults after allocating the timer stack; the main process
+waits until timeout. The debug run also found sigfillset's all-bits mask rejected
+by raw175. The follow-up removes rejection of unsupported63/64 mask bits from
+raw174/175/179/119 consistently; installation/sending of those two signal
+numbers remains EINVAL. The extension covers full blocking masks, full sa_mask,
+and a full saved-mask edit. It passes natively and on RV64 (0/1/139 with the
+broken controls); the preceding board build fails the extended positive at1.
+The application manager's raw175 now succeeds, but its post-mapping fault and
+the absence of an X11 connection persist. That application run is not a pass.
+
+Independent final review accepts the seven-patch Nix stack and narrowed clone
+source. Every patch applies at zero fuzz and zero offset in declared order;
+all supported flake evaluations pass without builds or IFD, formatting passes,
+and the lock is unchanged. A real cross-build also exercised patchPhase.
+Operational logs and exact board commands remain in the local handover.

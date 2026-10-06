@@ -10,6 +10,11 @@ pkgs.box64.overrideAttrs (old: {
   };
   # Old ld-linux has version definitions without a version-needs table.
   # Resolve those definitions instead of passing a null name to strcmp.
+  # ORDER IS LOAD-BEARING: brk, startup-syscalls, legacy-sigframe,
+  # ordinary-syscalls and clone-tls all edit src/emu/x86syscall_32.c.
+  # Each patch was generated with its predecessors applied. Append at the end.
+  # Verified in this order: zero fuzz and zero offset for every hunk.
+  # Flake evaluation alone does not run patchPhase; a real build does.
   patches = (old.patches or [ ]) ++ [
     ./box64-elf32-version-definitions.patch
     # Keep the first matching weak provider: old libc and ld-linux both
@@ -20,9 +25,12 @@ pkgs.box64.overrideAttrs (old: {
     # Raw i386 syscalls used when guest libc is emulated rather than wrapped.
     ./box64-elf32-startup-syscalls.patch
     # i386 legacy signal frame: build a real frame for non-SA_SIGINFO
-    # handlers and unwind it in sigreturn(119). See
-    # /var/tmp/megatouch/handover/notes/sigframe-implementation-plan.md
+    # handlers and unwind it in sigreturn(119). Runtime status is in AUDIT.md.
     ./box64-elf32-legacy-sigframe.patch
+    # File, time and descriptor syscalls with the i386 kernel ABI.
+    ./box64-elf32-ordinary-syscalls.patch
+    # Separate-PID CLONE_VM children need independent initialized host TLS.
+    ./box64-elf32-clone-tls.patch
   ];
   # RV64 libc has no x86 port-permission calls. Match Box64's existing
   # 64-bit iopl wrapper instead of leaving BOX32's weak imports unresolved.

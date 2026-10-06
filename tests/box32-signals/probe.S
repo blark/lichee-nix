@@ -12,9 +12,94 @@ install:
  int $0x80
  test %eax,%eax
  jnz failed
+ # Kernel oldact is exactly20 bytes, not libc's128-byte mask layout.
+ mov $174,%eax
+ mov %edi,%ebx
+ xor %ecx,%ecx
+ mov $queried_action,%edx
+ mov $8,%esi
+ int $0x80
+ test %eax,%eax
+ jnz failed
+ cmpl $handler,queried_action
+ jne failed
+ cmpl $0x04000000,queried_action+4
+ jne failed
+ cmpl $restorer,queried_action+8
+ jne failed
+ cmpl $0x12345678,queried_action+20
+ jne failed
  inc %edi
  cmp $35,%edi
  jne install
+ mov $174,%eax
+ mov $32,%ebx
+ xor %ecx,%ecx
+ xor %edx,%edx
+ mov $4,%esi
+ int $0x80
+ cmp $-22,%eax
+ jne failed
+ mov $174,%eax
+ mov $1,%ecx
+ mov $8,%esi
+ int $0x80
+ cmp $-14,%eax
+ jne failed
+ mov $179,%eax
+ mov $1,%ebx
+ mov $8,%ecx
+ int $0x80
+ cmp $-14,%eax
+ jne failed
+ # sigfillset produces all64 bits. A full mask must not cause EINVAL.
+ mov $175,%eax
+ mov $2,%ebx
+ mov $full_mask,%ecx
+ xor %edx,%edx
+ mov $8,%esi
+ int $0x80
+ test %eax,%eax
+ jnz failed
+ # An all-bits sa_mask and an all-bits saved-frame edit must also work.
+ mov $174,%eax
+ mov $35,%ebx
+ mov $full_action,%ecx
+ xor %edx,%edx
+ mov $8,%esi
+ int $0x80
+ test %eax,%eax
+ jnz failed
+ mov $20,%eax
+ int $0x80
+ mov %eax,%ebx
+ mov $37,%eax
+ mov $35,%ecx
+ int $0x80
+ test %eax,%eax
+ jnz failed
+ mov $179,%eax
+ mov $empty,%ebx
+ mov $8,%ecx
+ int $0x80
+ cmp $-4,%eax
+ jne failed
+ cmpl $1,full_seen
+ jne failed
+ mov $175,%eax
+ mov $2,%ebx
+ xor %ecx,%ecx
+ mov $queried,%edx
+ mov $8,%esi
+ int $0x80
+ test %eax,%eax
+ jnz failed
+ cmpl $0xfffbfeff,queried
+ jne failed
+ mov queried+4,%eax
+ and $0x3fffffff,%eax
+ cmp $0x3fffffff,%eax
+ jne failed
  mov $175,%eax
  mov $2,%ebx
  mov $blocked,%ecx
@@ -36,6 +121,7 @@ cycle:
  jnz failed
  # Every RT signal remains pending until the atomic suspend unblocks it.
  fninit
+ fldt extended_value
  fld1
  pcmpeqd %xmm0,%xmm0
  mov $179,%eax
@@ -65,6 +151,13 @@ cycle:
  cmpl $0,fp_result
  jne failed
  cmpl $0x3ff00000,fp_result+4
+ jne failed
+ fstpt extended_result
+ cmpl $1,extended_result
+ jne failed
+ cmpl $0x80000000,extended_result+4
+ jne failed
+ cmpw $0x3fff,extended_result+8
  jne failed
  # sigreturn must restore the blocked mask, including its high word.
  mov $175,%eax
@@ -285,6 +378,11 @@ handler_done:
 bad_frame:
  movl $1,frame_error
  jmp handler_done
+full_handler:
+ movl $1,full_seen
+ movl $-1,88(%esp)
+ movl $-1,720(%esp)
+ ret
 restorer:
 #ifndef OMIT_RESTORER_POP
  pop %eax
@@ -303,6 +401,9 @@ action: .long handler,0x04000000,restorer,0,1
 action: .long handler,0x04000000,restorer,0,0
 #endif
 blocked: .long 0x80000000,3
+full_mask: .long -1,-1
+full_action: .long full_handler,0x04000000,restorer,-1,-1
+full_seen: .long 0
 empty: .long 0,0
 queried: .long 0,0
 count32: .long 0
@@ -326,3 +427,12 @@ fp_result: .long 0,0
 child_stack: .skip 65536
 child_stack_end:
 .section .note.GNU-stack,"",@progbits
+
+.section .rodata
+extended_value: .quad 0x8000000000000001
+ .word 0x3fff
+.bss
+extended_result: .skip 10
+
+.data
+queried_action: .long 0,0,0,0,0,0x12345678

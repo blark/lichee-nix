@@ -1,174 +1,455 @@
---- a/src/libtools/signal32.c	2026-10-06 09:51:11.939904278 -0400
-+++ b/src/libtools/signal32.c	2026-10-06 09:51:40.826740808 -0400
-@@ -258,7 +258,13 @@
+--- a/src/dynarec/rv64/dynarec_rv64_00_3.c
++++ b/src/dynarec/rv64/dynarec_rv64_00_3.c
+@@ -564,8 +564,12 @@
+                 SMEND();
+                 GETIP(addr, x7);
+                 STORE_XEMU_CALL(x3);
+-                CALL_S(const_x86syscall, -1, 0);
+-                LOAD_XEMU_CALL();
++                // A raw guest signal can edit every saved register and flags
++                // while this helper runs. C callee-save rules do not restore
++                // those guest edits; reload the remaining guest registers too.
++                READFLAGS(X_ALL);
++                CALL(const_x86syscall, -1, 0, 0);
++                LOAD_XEMU_REM(x3);
+                 TABLE64(x3, addr); // expected return address
+                 BNE_MARK(xRIP, x3);
+                 LW(x1, xEmu, offsetof(x64emu_t, quit));
+--- a/src/emu/x64run.c
++++ b/src/emu/x64run.c
+@@ -1709,6 +1709,8 @@
+                 // 32bits syscall
+                 #ifndef TEST_INTERPRETER
+                 EmuX86Syscall(emu);
++                if(emu->quit) goto fini; // sigreturn ends the inner runner
++                addr=R_RIP; // honor a guest context edited by signal return
+                 STEP2;
+                 #endif
+             } else if (tmp8u==0x03) {
+--- a/src/libtools/signal32.c
++++ b/src/libtools/signal32.c
+@@ -12,6 +12,7 @@
+ #include <setjmp.h>
+ #include <sys/mman.h>
+ #include <pthread.h>
++#include <linux/futex.h>
+ #ifndef ANDROID
+ #include <execinfo.h>
+ #endif
+@@ -32,10 +33,13 @@
+ #include "emu/x87emu_private.h"
+ #include "custommem.h"
+ #include "bridge.h"
++#include "sigtools.h"
+ #ifdef DYNAREC
+ #include "dynablock.h"
+ #include "../dynarec/dynablock_private.h"
+ #include "dynarec_native.h"
++#include "dynarec/dynarec_arch.h"
++#include "dynarec/dynarec_next.h"
+ #if defined(ARM64)
+ #include "dynarec/arm64/arm64_mapping.h"
+ #define CONTEXT_REG(P, X)   P->uc_mcontext.regs[X]
+@@ -258,8 +262,8 @@
      ptr_t           pretcode;   // pointer to retcode
      int             sig;
      i386_mcontext_t cpustate;
 -    struct i386_xstate fpstate;
-+    // NOT struct i386_xstate: it carries an xsave header and is
-+    // __attribute__((aligned(64))), which pads this member from 96 to 128 and
-+    // pushes extramask to 832. The kernel's LEGACY frame has a bare 624-byte
-+    // _fpstate at 96 and extramask at 720. Measured: i386_fpstate==624,
-+    // i386_xstate==704, __alignof__(i386_xstate)==64. i386_xstate keeps its
-+    // alignment because the rt/SA_SIGINFO path needs it.
+-    ptr_t           extramask[64-1];
 +    struct i386_fpstate fpstate;
-     ptr_t           extramask[64-1];
++    ptr_t           extramask[1];
      char            retcode[8];
  } i386_sigframe_t;
-@@ -333,6 +339,29 @@
+ 
+@@ -333,6 +337,311 @@
  
  x64_stack_t* sigstack_getstack();
  int my_sigaltstack(x64emu_t* emu, const x64_stack_t* ss, x64_stack_t* oss);
-+// Unwind a LEGACY signal frame for sigreturn(119). __restore has already
-+// popped the signal number, so ESP is frame+8 and the frame starts 8 below.
-+// Offsets verified against the kernel: cpustate 8, FP 96, extramask 720.
-+int my32_sigreturn(x64emu_t* emu)
++static void raw_save_fp32(x64emu_t* emu, struct i386_fpstate* fp)
 +{
-+    i386_sigframe_t* f = (i386_sigframe_t*)from_ptrv(R_ESP - 8);
-+    i386_mcontext_t* m = &f->cpustate;
-+    R_EAX = m->gregs[I386_EAX]; R_ECX = m->gregs[I386_ECX];
-+    R_EDX = m->gregs[I386_EDX]; R_EBX = m->gregs[I386_EBX];
-+    R_ESI = m->gregs[I386_ESI]; R_EDI = m->gregs[I386_EDI];
-+    R_EBP = m->gregs[I386_EBP]; R_ESP = m->gregs[I386_ESP];
-+    emu->eflags.x64 = m->gregs[I386_EFL];
-+    R_EIP = m->gregs[I386_EIP];
-+    {   // pre-signal mask: oldmask is the low word, extramask[0] the high one
-+        sigset_t set;
-+        sigemptyset(&set);
-+        for(int i=0; i<32; ++i) if(m->oldmask & (1u<<i)) sigaddset(&set, i+1);
-+        for(int i=0; i<32; ++i) if(f->extramask[0] & (1u<<i)) sigaddset(&set, i+33);
-+        sigprocmask(SIG_SETMASK, &set, NULL);
++    save_fpreg(emu,fp);
++    uint16_t physical_tags=0;
++    uint8_t compact_tags=0;
++    for(int i=0;i<8;++i) {
++        int physical=(emu->top+i)&7;
++        int tag=(emu->fpu_tags>>(2*i))&3;
++        physical_tags|=tag<<(2*physical);
++        if(tag!=3) compact_tags|=1<<physical;
++        if(fpu_ld80_raw_valid(emu,i)) memcpy(&fp->_st[i],&STld(i).ld,10);
++        else D2LD(&ST(i),&fp->_st[i]);
++        memcpy(&fp->_fxsr_st[i],&fp->_st[i],10);
 +    }
++    fp->tag=physical_tags;
++    ((uint8_t*)fp->_fxsr_env)[4]=compact_tags;
++    fp->status_magic=emu->sw.x16; // magic==0 identifies the FXSR extension
++}
++static void raw_load_fp32(x64emu_t* emu, struct i386_fpstate* fp)
++{
++    // Restore the legacy i387 fields too: applications can edit that region.
++    load_fpreg(emu,fp);
++    emu->fpu_tags=0;
++    emu->fpu_stack=0;
++    for(int i=0;i<8;++i) {
++        int tag=(fp->tag>>(2*((emu->top+i)&7)))&3;
++        emu->fpu_tags|=tag<<(2*i);
++        if(tag!=3) ++emu->fpu_stack;
++        LD2D(&fp->_st[i],&ST(i));
++        memcpy(&STld(i).ld,&fp->_st[i],10);
++        STld(i).uref=ST(i).q;
++    }
++}
++
++/* Raw int-0x80 actions use the kernel's 20-byte ABI, never libc sigaction. */
++typedef struct kernel_action32_s {
++    uint32_t handler, flags, restorer, mask[2];
++} kernel_action32_t;
++_Static_assert(sizeof(kernel_action32_t)==20, "kernel action32 size");
++_Static_assert(offsetof(i386_sigframe_t, cpustate)==8, "legacy context offset");
++_Static_assert(offsetof(i386_sigframe_t, fpstate)==96, "legacy FP offset");
++_Static_assert(offsetof(i386_sigframe_t, extramask)==720, "legacy mask offset");
++
++// Keep host NPTL's reserved 32/33 untouched. Guest 32/33 use host 63/64.
++// Guest 63/64 cannot be installed/sent in this initial raw implementation:
++// return EINVAL rather than aliasing two independently queued guest signals.
++static int raw_native_signal32(int sig)
++{
++    if(sig==32) return 63;
++    if(sig==33) return 64;
++    return signal_from_x64(sig);
++}
++static uint64_t raw_native_mask32(uint64_t guest)
++{
++    uint64_t native=0;
++    for(int sig=1;sig<=62;++sig)
++        if(guest & (UINT64_C(1)<<(sig-1)))
++            native |= UINT64_C(1)<<(raw_native_signal32(sig)-1);
++    return native;
++}
++static uint64_t raw_guest_mask32(uint64_t native)
++{
++    uint64_t guest=0;
++    for(int sig=1;sig<=62;++sig)
++        if(native & (UINT64_C(1)<<(raw_native_signal32(sig)-1)))
++            guest |= UINT64_C(1)<<(sig-1);
++    return guest;
++}
++static int raw_memory32(uint32_t addr, size_t size, int prot)
++{
++    if(!addr || addr>=0xc0000000U || size>0xc0000000U-addr) return 0;
++    for(uintptr_t p=addr;p<(uintptr_t)addr+size;
++        p=(p&~(uintptr_t)(box64_pagesize-1))+box64_pagesize)
++        if((getProtection(p)&prot)!=prot) return 0;
++    return 1;
++}
++// Serialize action snapshots and installation without letting an interrupt
++// take a gate held by the interrupted thread. Block signals BEFORE taking it
++// and release it BEFORE restoring the mask; handlers never hold it in guest code.
++static uint32_t raw_action_gate32;
++static uint64_t raw_lock_actions32(void)
++{
++    uint64_t all=UINT64_MAX, saved=0;
++    syscall(__NR_rt_sigprocmask,SIG_BLOCK,&all,&saved,8);
++    for(;;) {
++        uint32_t expected=0;
++        if(__atomic_compare_exchange_n(&raw_action_gate32,&expected,1,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED))
++            return saved;
++        syscall(__NR_futex,&raw_action_gate32,FUTEX_WAIT_PRIVATE,1,NULL,NULL,0);
++    }
++}
++static void raw_unlock_actions32(uint64_t saved)
++{
++    __atomic_store_n(&raw_action_gate32,0,__ATOMIC_RELEASE);
++    syscall(__NR_futex,&raw_action_gate32,FUTEX_WAKE_PRIVATE,1,NULL,NULL,0);
++    syscall(__NR_rt_sigprocmask,SIG_SETMASK,&saved,NULL,8);
++}
++
++int my32_raw_sigprocmask(x64emu_t* emu, int how, uint32_t set, uint32_t old, int size)
++{
++    (void)emu;
++    if(size!=8) { errno=EINVAL; return -1; }
++    if((set && !raw_memory32(set,8,PROT_READ)) || (old && !raw_memory32(old,8,PROT_WRITE))) {
++        errno=EFAULT; return -1;
++    }
++    uint64_t guest=0, native=0, previous=0, current=0;
++    if(set) {
++        memcpy(&guest, from_ptrv(set), 8);
++        // Unsupported guest63/64 mask bits are ignored, like mask bits beyond
++        // the implemented signal set. sigfillset must still be usable.
++        native=raw_native_mask32(guest);
++        if(how==SIG_SETMASK) {
++            if(syscall(__NR_rt_sigprocmask, SIG_SETMASK, NULL, &current, 8)) return -1;
++            native|=current & (UINT64_C(3)<<31);
++        }
++    }
++    int r=syscall(__NR_rt_sigprocmask, how, set?&native:NULL, old?&previous:NULL, 8);
++    if(!r && old) { guest=raw_guest_mask32(previous); memcpy(from_ptrv(old),&guest,8); }
++    return r;
++}
++
++int32_t my32_raw_sigsuspend(x64emu_t* emu, uint32_t set, int size)
++{
++    if(size!=8) { errno=EINVAL; return -EINVAL; }
++    if(!raw_memory32(set,8,PROT_READ)) { errno=EFAULT; return -EFAULT; }
++    uint64_t guest, native, current=0;
++    memcpy(&guest,from_ptrv(set),8);
++    if(syscall(__NR_rt_sigprocmask,SIG_SETMASK,NULL,&current,8)) return -errno;
++    native=raw_native_mask32(guest) | (current & (UINT64_C(3)<<31));
++    unsigned serial=emu->raw_signal_serial32;
++    R_EAX=(uint32_t)-EINTR;
++    int r=syscall(__NR_rt_sigsuspend,&native,8);
++    // A handler may intentionally edit saved EAX. Do not overwrite that edit
++    // with the host syscall's EINTR when resuming the interrupted guest.
++    if(emu->raw_signal_serial32!=serial) return S_EAX;
++    return r==-1?-errno:r;
++}
++int my32_raw_kill(x64emu_t* emu, int pid, int sig)
++{
++    (void)emu;
++    if(sig<0 || sig>62) { errno=EINVAL; return -1; }
++    return kill(pid, sig?raw_native_signal32(sig):0);
++}
++
++typedef struct raw_signal_run32_s {
++    uint32_t frame;
++    int returned;
++    uint64_t mask;
++} raw_signal_run32_t;
++
++uint32_t my32_sigreturn(x64emu_t* emu)
++{
++    raw_signal_run32_t* run=emu->raw_signal_run32;
++    uint32_t addr=R_ESP-8;
++    if(!run || addr!=run->frame || !raw_memory32(addr,sizeof(i386_sigframe_t),PROT_READ))
++        goto bad_frame;
++    i386_sigframe_t frame;
++    memcpy(&frame,from_ptrv(addr),sizeof(frame));
++    i386_mcontext_t* m=&frame.cpustate;
++    if((m->gregs[I386_CS]&3)!=3 || (m->gregs[I386_SS]&3)!=3) goto bad_frame;
++    struct i386_fpstate fp;
++    if(m->fpregs) {
++        if(!raw_memory32(m->fpregs,sizeof(fp),PROT_READ)) goto bad_frame;
++        memcpy(&fp,from_ptrv(m->fpregs),sizeof(fp));
++        raw_load_fp32(emu,&fp);
++    }
++    #define GO(R) R_##R=m->gregs[I386_##R]
++    GO(EAX); GO(ECX); GO(EDX); GO(EBX); GO(ESI); GO(EDI); GO(EBP); GO(ESP); GO(EIP);
++    GO(CS); GO(SS); GO(DS); GO(ES); GO(FS); GO(GS);
++    #undef GO
++    for(int seg=0;seg<6;++seg) {
++        emu->segs_offs[seg]=0;
++        GetSegmentBaseEmu(emu,seg);
++    }
++    emu->eflags.x64=(emu->eflags.x64&~0x40dd5U) | (m->gregs[I386_EFL]&0x40dd5U) | 2;
++    RESET_FLAGS(emu);
++    run->mask=(uint64_t)m->oldmask | ((uint64_t)frame.extramask[0]<<32);
++    run->returned=1;
++    ++emu->raw_signal_serial32;
++    emu->quit=1; // finish just the inner handler interpreter, not the process
 +    return R_EAX;
++bad_frame:
++    // Malformed signal frames are fatal, not a recoverable syscall errno.
++    signal(SIGSEGV,SIG_DFL);
++    raise(SIGSEGV);
++    _exit(128+SIGSEGV);
++}
++
++static void raw_handler32(int native_sig, siginfo_t* info, void* context)
++{
++    int sig=native_sig==63?32:native_sig==64?33:signal_to_x64(native_sig);
++    x64emu_t* emu=thread_get_emu();
++    kernel_action32_t action;
++    uint64_t snapshot_mask=raw_lock_actions32();
++    memcpy(&action,my_context->raw_sigaction32[sig],sizeof(action));
++    if(action.flags&SA_RESETHAND) memset(my_context->raw_sigaction32[sig],0,sizeof(action));
++    raw_unlock_actions32(snapshot_mask);
++    ucontext_t* p=context;
++    int locks=unlockMutex();
++    #ifdef DYNAREC
++    void* pc=(void*)CONTEXT_PC(p);
++    dynablock_t* db=FindDynablockFromNativeAddress(pc);
++    if(db) {
++        uintptr_t guest_pc=getX64Address(db,(uintptr_t)pc);
++        copyUCTXreg2Emu(emu,p,guest_pc);
++        adjustregs(emu,pc);
++        if(db->arch_size) ARCH_ADJUST(db,emu,p,guest_pc);
++    }
++    #endif
++    CHECK_FLAGS(emu);
++    uint64_t native_mask=0;
++    memcpy(&native_mask,&p->uc_sigmask,8);
++    uint64_t oldmask=raw_guest_mask32(native_mask);
++    uint32_t sp=R_ESP;
++    x64_stack_t* alt=(action.flags&SA_ONSTACK)?sigstack_getstack():NULL;
++    int used_alt=alt && !(alt->ss_flags&SS_ONSTACK);
++    if(used_alt) { sp=(uintptr_t)alt->ss_sp+alt->ss_size; alt->ss_flags|=SS_ONSTACK; }
++    uint32_t addr=(sp-sizeof(i386_sigframe_t))&~15U;
++    if(!raw_memory32(addr,sizeof(i386_sigframe_t),PROT_WRITE)) {
++        signal(SIGSEGV,SIG_DFL); raise(SIGSEGV); _exit(128+SIGSEGV);
++    }
++    i386_sigframe_t* f=from_ptrv(addr);
++    memset(f,0,sizeof(*f));
++    f->sig=sig;
++    f->pretcode=(action.flags&0x04000000U)?action.restorer:to_ptrv(f->retcode);
++    const uint8_t trampoline[8]={0x58,0xb8,0x77,0,0,0,0xcd,0x80};
++    memcpy(f->retcode,trampoline,8);
++    #define GO(R) f->cpustate.gregs[I386_##R]=R_##R
++    GO(EAX); GO(ECX); GO(EDX); GO(EBX); GO(ESI); GO(EDI); GO(EBP); GO(ESP); GO(EIP);
++    GO(CS); GO(SS); GO(DS); GO(ES); GO(FS); GO(GS);
++    #undef GO
++    f->cpustate.gregs[I386_EFL]=emu->eflags.x64;
++    f->cpustate.gregs[I386_UESP]=R_ESP;
++    raw_save_fp32(emu,&f->fpstate);
++    f->cpustate.fpregs=to_ptrv(&f->fpstate);
++    f->cpustate.oldmask=oldmask;
++    f->extramask[0]=oldmask>>32;
++    raw_signal_run32_t run={.frame=addr};
++    void* previous_run=emu->raw_signal_run32;
++    int previous_quit=emu->quit;
++    int previous_need=emu->flags.need_jmpbuf;
++    emu->raw_signal_run32=&run;
++    emu->quit=0;
++    emu->flags.need_jmpbuf=1;
++    R_ESP=addr; R_EIP=action.handler;
++    RESET_FLAGS(emu);
++    CLEAR_FLAG(F_TF); CLEAR_FLAG(F_DF);
++    printf_log(LOG_DEBUG,"Raw signal32 %d: handler=%p frame=%p interrupted=%p fault=%p eax=%x ebx=%x ecx=%x edx=%x esp=%x ebp=%x\n",
++        sig,from_ptrv(R_EIP),f,from_ptrv(f->cpustate.gregs[I386_EIP]),info->si_addr,
++        f->cpustate.gregs[I386_EAX],f->cpustate.gregs[I386_EBX],
++        f->cpustate.gregs[I386_ECX],f->cpustate.gregs[I386_EDX],
++        f->cpustate.gregs[I386_ESP],f->cpustate.gregs[I386_EBP]);
++    // Enter the kernel frame directly. No EmuCall/DynaCall exit-address push
++    // and no saved-register epilogue that could undo a guest sigcontext edit.
++    EmuRun(emu,0,0);
++    emu->raw_signal_run32=previous_run;
++    emu->flags.need_jmpbuf=previous_need;
++    if(used_alt) alt->ss_flags&=~SS_ONSTACK;
++    if(!run.returned) _exit(R_EAX);
++    emu->quit=previous_quit;
++    // The host kernel restores its context mask after this C handler returns.
++    // Preserve guest sigreturn edits there too, including nested delivery.
++    uint64_t restored=raw_native_mask32(run.mask) | (native_mask & (UINT64_C(3)<<31));
++    memcpy(&p->uc_sigmask,&restored,8);
++    #ifdef DYNAREC
++    if(db) copyEmu2USignalCTXreg(p,emu,native_epilog);
++    #endif
++    relockMutex(locks);
++}
++
++int my32_raw_sigaction(x64emu_t* emu, int sig, uint32_t act, uint32_t old, int size)
++{
++    (void)emu;
++    if(size!=8 || sig<1 || sig>62 || sig==SIGKILL || sig==SIGSTOP) { errno=EINVAL; return -1; }
++    if((act && !raw_memory32(act,20,PROT_READ)) || (old && !raw_memory32(old,20,PROT_WRITE))) {
++        errno=EFAULT; return -1;
++    }
++    kernel_action32_t action, previous;
++    if(act) {
++        memcpy(&action,from_ptrv(act),sizeof(action));
++        uint64_t mask=(uint64_t)action.mask[0] | ((uint64_t)action.mask[1]<<32);
++        if((action.flags&SA_SIGINFO) && action.handler>1) { errno=ENOTSUP; return -1; }
++        struct sigaction native={0};
++        uint64_t mapped=raw_native_mask32(mask);
++        memcpy(&native.sa_mask,&mapped,8);
++        native.sa_flags=(action.flags&~0x04000000U) | (action.handler>1?SA_SIGINFO:0);
++        native.sa_sigaction=action.handler>1?raw_handler32:(void*)(uintptr_t)action.handler;
++        uint64_t saved=raw_lock_actions32();
++        memcpy(&previous,my_context->raw_sigaction32[sig],sizeof(previous));
++        int r=sigaction(raw_native_signal32(sig),&native,NULL);
++        int saved_errno=errno;
++        if(!r) memcpy(my_context->raw_sigaction32[sig],&action,sizeof(action));
++        raw_unlock_actions32(saved);
++        errno=saved_errno;
++        if(r) return r;
++    }
++    if(!act) {
++        uint64_t saved=raw_lock_actions32();
++        memcpy(&previous,my_context->raw_sigaction32[sig],sizeof(previous));
++        raw_unlock_actions32(saved);
++    }
++    if(old) memcpy(from_ptrv(old),&previous,sizeof(previous));
++    return 0;
 +}
 +
  EXPORT int my32_sigaltstack(x64emu_t* emu, const i386_stack_t* ss, i386_stack_t* oss)
  {
      x64_stack_t ss_ = {0};
-@@ -718,7 +747,25 @@
-     if(sig!=X64_SIGSEGV && !(Locks&is_dyndump_locked) && !(Locks&is_memprot_locked))
-         dynarec = BOX64ENV(dynarec_interp_signal)?0:1;
-     #endif
--    ret = RunFunctionHandler32(&exits, dynarec, sigcontext, my_context->signals[info2->si_signo], 3, info2->si_signo, info2, sigcontext);
-+    // LEGACY (non-SA_SIGINFO) path: lay a real frame on the guest stack so that
-+    // glibc's __restore ("pop %eax; mov $0x77,%eax; int $0x80") has something to
-+    // pop and sigreturn has something to unwind.
-+    i386_sigframe_t* sframe = NULL;
-+    if(simple) {
-+        R_ESP = (R_ESP - sizeof(i386_sigframe_t)) & ~15;
-+        sframe = (i386_sigframe_t*)from_ptrv(R_ESP);
-+        memset(sframe, 0, sizeof(*sframe));
-+        sframe->pretcode = to_ptrv((void*)restorer);
-+        sframe->sig = info2->si_signo;
-+        sframe->cpustate = sigcontext->uc_mcontext;
-+        memcpy(&sframe->fpstate, xstate, sizeof(sframe->fpstate));
-+        sframe->cpustate.fpregs = to_ptrv(&sframe->fpstate);
-+        sframe->cpustate.oldmask = sigcontext->uc_sigmask.sig[0];
-+        sframe->extramask[0] = sigcontext->uc_sigmask.sig[1];
-+    }
-+    ret = simple
-+        ? RunFunctionHandler32(&exits, dynarec, sigcontext, my_context->signals[info2->si_signo], 1, info2->si_signo)
-+        : RunFunctionHandler32(&exits, dynarec, sigcontext, my_context->signals[info2->si_signo], 3, info2->si_signo, info2, sigcontext);
-     // restore old value from emu
-     if(used_stack)  // release stack
-         new_ss->ss_flags = 0;
-@@ -815,6 +862,11 @@
-         exit(ret);
-     }
-     if(restorer)
-+        if(sframe) {
-+            // Enter __restore with ESP at &sframe->sig, so its pop consumes the
-+            // signal number and leaves ESP == frame+8 - where sigreturn looks.
-+            R_ESP = to_ptrv(&sframe->sig);
-+        }
-         RunFunctionHandler32(&exits, 0, NULL, restorer, 0);
-     relockMutex(Locks);
-     return 0;
-@@ -844,7 +896,11 @@
-     void* db = NULL;
-     #endif
- 
--    my_sigactionhandler_oldcode_32(emu, sig, 0, info, ucntx, NULL, db);
-+    // simple==1 means the guest installed WITHOUT SA_SIGINFO and expects a
-+    // one-argument handler over a LEGACY frame. This was hardcoded to 0, so
-+    // every 32-bit signal took the SA_SIGINFO path regardless of how the guest
-+    // installed it. signals.c:1315 already derives it this way.
-+    my_sigactionhandler_oldcode_32(emu, sig, my_context->is_sigaction[sig]?0:1, info, ucntx, NULL, db);
+--- a/src/emu/x86syscall_32.c
++++ b/src/emu/x86syscall_32.c
+@@ -362,6 +362,11 @@
+     return (uint32_t)now;
  }
  
++uint32_t my32_sigreturn(x64emu_t* emu);
++int my32_raw_sigaction(x64emu_t* emu, int sig, uint32_t act, uint32_t old, int size);
++int my32_raw_sigprocmask(x64emu_t* emu, int how, uint32_t set, uint32_t old, int size);
++int32_t my32_raw_sigsuspend(x64emu_t* emu, uint32_t set, int size);
++int my32_raw_kill(x64emu_t* emu, int pid, int sig);
+ pid_t my_vfork(x64emu_t* emu);
+ uint32_t my_modify_ldt(x64emu_t* emu, int op, thread_area_32_t* td, int size);
  
---- a/src/emu/x86syscall_32.c	2026-10-06 09:51:11.938128255 -0400
-+++ b/src/emu/x86syscall_32.c	2026-10-06 10:05:17.241616100 -0400
-@@ -71,6 +71,9 @@
-     //{ 33, __NR_access, 2 },
-     //{ 37, __NR_kill, 2 },
-     //{ 38, __NR_rename, 2 },
-+    // NOT enabled: riscv64 has no __NR_mkdir, only mkdirat. Needs a wrapper,
-+    // and it is not on the critical path - 17 of the guest's 20 mkdir calls
-+    // fail with EEXIST natively anyway.
-     //{ 39, __NR_mkdir, 2 },
-     //{ 40, __NR_rmdir, 1 },
-     //{ 41, __NR_dup, 1 },
-@@ -134,8 +137,13 @@
-     //{ 168, __NR_poll, 3 },    // wrapped to allow SA_RESTART wrapping by libc
-     { 172, __NR_prctl, 5 },
-     //{ 173, __NR_rt_sigreturn, 0 },
--    //{ 175, __NR_rt_sigprocmask, 4 },
--    //{ 179, __NR_rt_sigsuspend, 2 },
-+    // Passthrough is correct here, unlike sigreturn: these act on the HOST
-+    // signal mask, which is what box64 uses to deliver guest signals. And
-+    // i386's 2x32-bit sigset is byte-identical to a 64-bit little-endian one,
-+    // so the pointer needs no conversion. Without these, glibc falls back to
-+    // legacy 126/72 which are also unserved, and the guest spins.
-+    { 175, __NR_rt_sigprocmask, 4 },
-+    { 179, __NR_rt_sigsuspend, 2 },
-     //{ 183, __NR_getcwd, 2 },
-     //{ 184, __NR_capget, 2},
-     //{ 185, __NR_capset, 2},
-@@ -276,6 +284,8 @@
- void* my32_mmap64(x64emu_t* emu, void *addr, size_t length, int prot, int flags, int fd, int64_t offset);
- int my32_munmap(x64emu_t* emu, void* addr, unsigned long length);
- int my32_sigaltstack(x64emu_t* emu, const i386_stack_t* ss, i386_stack_t* oss);
-+int my32_sigreturn(x64emu_t* emu);
-+int my32_sigaction(x64emu_t* emu, int signum, const i386_sigaction_t *act, i386_sigaction_t *oldact);
- int my32_getrlimit(x64emu_t* emu, int resource, uint32_t* limits);
- int my32_setrlimit(x64emu_t* emu, int resource, uint32_t* limits);
- 
-@@ -637,6 +647,18 @@
+@@ -637,6 +642,24 @@
              }
              break;
          }
-+        case 119:   // sys_sigreturn - unwind a LEGACY (non-SA_SIGINFO) frame.
-+            // THIS is the raw int $0x80 path, which is what glibc 2.2 uses when
-+            // libc is emulated. The copy in my32_syscall below serves the libc
-+            // syscall() wrapper instead; both are needed.
-+            R_EAX = my32_sigreturn(emu);
++        case 37:
++            S_EAX=my32_raw_kill(emu,S_EBX,S_ECX);
++            if(S_EAX==-1) S_EAX=-errno;
 +            break;
-+        case 174:   // sys_rt_sigaction
-+            // Absent from this switch entirely; the only copy was in a #if 0
-+            // block in my32_syscall. Without it the guest cannot install a
-+            // handler, so the whole signal path is unreachable.
-+            R_EAX = (uint32_t)my32_sigaction(emu, R_EBX, (i386_sigaction_t*)from_ptrv(R_ECX), (i386_sigaction_t*)from_ptrv(R_EDX));
++        case 119:
++            R_EAX=my32_sigreturn(emu);
++            break;
++        case 174:
++            S_EAX=my32_raw_sigaction(emu,R_EBX,R_ECX,R_EDX,R_ESI);
++            if(S_EAX==-1) S_EAX=-errno;
++            break;
++        case 175:
++            S_EAX=my32_raw_sigprocmask(emu,R_EBX,R_ECX,R_EDX,R_ESI);
++            if(S_EAX==-1) S_EAX=-errno;
++            break;
++        case 179:
++            S_EAX=my32_raw_sigsuspend(emu,R_EBX,R_ECX);
 +            break;
          case 186:   // sigaltstack
              S_EAX = my32_sigaltstack(emu, from_ptrv(R_EBX), from_ptrv(R_ECX));
              if(S_EAX==-1 && errno>0)
-@@ -854,6 +876,18 @@
-         case 174:   // sys_rt_sigaction
-             return (uint32_t)my32_sigaction(emu, i32(0), (x86_sigaction_t*)p(4), (x86_sigaction_t*)p(8));
+@@ -832,6 +855,19 @@
+                 return (uint32_t)syscall(__NR_clone, u32(0), p(4), p(8), p(12), p(16));
+             break;
  #endif
-+        case 119:   // sys_sigreturn - unwind a LEGACY (non-SA_SIGINFO) frame.
-+            // Implemented in signal32.c because i386_sigframe_t and the I386_*
-+            // greg indices are local to that file. NOT a passthrough: handing a
-+            // GUEST frame to the HOST kernel is meaningless, which is why
-+            // upstream's commented-out { 119, __NR_sigreturn, 0 } was removed.
++        case 37:
++            return my32_raw_kill(emu,i32(0),i32(4));
++        case 119:
 +            return my32_sigreturn(emu);
-+        case 174:   // sys_rt_sigaction
-+            // Lifted OUT of the #if 0 block above, where it had bit-rotted to a
-+            // stale type name (x86_sigaction_t) and could not compile. Without
-+            // this the guest cannot install a handler at all, so the rest of the
-+            // signal path is unreachable and a frame builder alone does nothing.
-+            return (uint32_t)my32_sigaction(emu, i32(0), (i386_sigaction_t*)p(4), (i386_sigaction_t*)p(8));
-         case 186:   // sigaltstack
-             return my32_sigaltstack(emu, p(0), p(4));
-         case 192:   // mmap2
++        case 174:
++            return my32_raw_sigaction(emu,i32(0),u32(4),u32(8),i32(12));
++        case 175:
++            return my32_raw_sigprocmask(emu,i32(0),u32(4),u32(8),i32(12));
++        case 179: {
++            int32_t r=my32_raw_sigsuspend(emu,u32(0),i32(4));
++            if(r<0 && r>=-4095) { errno=-r; return -1; }
++            return r;
++        }
+         case 45: // brk
+             return guest_brk32(emu, u32(0));
+         case 13:
+--- a/src/emu/x64emu_private.h
++++ b/src/emu/x64emu_private.h
+@@ -99,6 +99,8 @@
+     // cpu helpers
+     reg64_t     zero;
+     reg64_t     *sbiidx[16];
++    void*       raw_signal_run32; // active legacy delivery; nested runners save/restore it
++    unsigned    raw_signal_serial32;
+     // emu control
+     int         quit;
+     int         error;
+--- a/src/include/box64context.h
++++ b/src/include/box64context.h
+@@ -241,6 +241,7 @@
+     uint8_t             canary[8];
+ 
+     uintptr_t           signals[MAX_SIGNAL+1];  // signal should be 1..MAX_SIGNAL (no 0), but that's too much change...
++    uint32_t            raw_sigaction32[65][5]; // kernel actions for fully emulated i386 libc
+     uintptr_t           restorer[MAX_SIGNAL+1];
+     int                 onstack[MAX_SIGNAL+1];
+     int                 is_sigaction[MAX_SIGNAL+1];
