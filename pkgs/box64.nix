@@ -31,6 +31,8 @@ pkgs.box64.overrideAttrs (old: {
     ./box64-elf32-ordinary-syscalls.patch
     # Separate-PID CLONE_VM children need independent initialized host TLS.
     ./box64-elf32-clone-tls.patch
+    # Descending fixed thread stacks must stay away from low PLT bridges.
+    ./box64-elf32-initial-stack.patch
   ];
   # RV64 libc has no x86 port-permission calls. Match Box64's existing
   # 64-bit iopl wrapper instead of leaving BOX32's weak imports unresolved.

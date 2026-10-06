@@ -1,0 +1,38 @@
+--- a/src/tools/box64stack.c
++++ b/src/tools/box64stack.c
+@@ -14,6 +14,10 @@
+ #include "auxval.h"
+ #include "custommem.h"
+ 
++#ifndef MAP_FIXED_NOREPLACE
++#define MAP_FIXED_NOREPLACE 0x100000
++#endif
++
+ EXPORTDYN
+ int CalcStackSize(box64context_t *context)
+ {
+@@ -23,7 +27,23 @@
+         CalcStack(context->elfs[i], &context->stacksz, &context->stackalign);
+ 
+     //if (posix_memalign((void**)&context->stack, context->stackalign, context->stacksz)) {
+-    context->stack = mmap(NULL, context->stacksz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_GROWSDOWN, -1, 0);
++    // LinuxThreads places fixed stacks below the initial stack. Putting that
++    // stack beside low-address translator bridges lets the guest overwrite
++    // its own PLT resolver. Use the upper end of the supported i386 range.
++    void* stack_hint=NULL;
++    int stack_flags=MAP_PRIVATE|MAP_ANONYMOUS|MAP_GROWSDOWN;
++    if(box64_is32bits) {
++        if(context->stacksz>=0xc0000000UL) return 1;
++        stack_hint=(void*)((0xc0000000UL-context->stacksz)&~(uintptr_t)(box64_pagesize-1));
++        stack_flags|=MAP_FIXED_NOREPLACE; // never overwrite existing mappings
++    }
++    context->stack = mmap(stack_hint, context->stacksz, PROT_READ|PROT_WRITE, stack_flags, -1, 0);
++    // Old kernels can ignore NOREPLACE. Reject a relocated stack rather than
++    // silently recreating the low-address bridge collision.
++    if(stack_hint && context->stack!=MAP_FAILED && context->stack!=stack_hint) {
++        munmap(context->stack,context->stacksz);
++        context->stack=MAP_FAILED;
++    }
+     if (context->stack==(void*)-1) {
+         printf_log(LOG_NONE, "Cannot allocate aligned memory (0x%lx/0x%zx) for stack\n", context->stacksz, context->stackalign);
+         return 1;

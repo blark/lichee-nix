@@ -788,3 +788,59 @@ source. Every patch applies at zero fuzz and zero offset in declared order;
 all supported flake evaluations pass without builds or IFD, formatting passes,
 and the lock is unchanged. A real cross-build also exercised patchPhase.
 Operational logs and exact board commands remain in the local handover.
+
+### Fixed thread-stack mapping overwrites the PLT resolver bridge
+
+The next fault is localized by a core, rather than inferred from mmap's return.
+The guest library's GOT resolver slot still points to a low translator bridge;
+that bridge now contains zero bytes. A valid two-MiB MAP_FIXED anonymous stack
+mapping replaced the bridge. Lazy binding then enters the new stack data and
+faults. A clean old_mmap wrapper with the same calling convention passes both
+natively and on RV64, so this is not a blanket argument-conversion failure.
+Interpreting only the mmap wrapper or the thread library does not repair it.
+
+`tests/box32-stack-bridge` reproduces without guest files or libc: allocate a
+fixed descending stack based on initial ESP, then first-bind a DSO function
+returning42. Native exits0; the preceding board build loses its resolver,
+traps SIGSEGV and requires the timeout's kill (137). This separates successful
+mapping from successful continuation.
+
+The eighth patch places the initial i386 stack at the upper end of the
+translator's supported address range, leaving descending thread stacks away
+from low translator bridges. MAP_FIXED_NOREPLACE prevents replacing an existing
+mapping; a kernel that ignores the flag and relocates the allocation is rejected.
+The 64-bit stack path is unchanged. This is a placement correction for the
+measured descending-stack collision, not general isolation of every translator
+allocation from arbitrary guest MAP_FIXED. Review and after-fix board results
+are pending below.
+
+### Filing classification checkpoint
+
+- RV64 kept a native callee-saved EBP copy across the syscall helper. A handler
+  edited saved EAX correctly, while saved EBP resumed as the handler's stale
+  value. Reloading the remaining guest registers fixes the measured instrument.
+- The interpreter kept its local instruction pointer after raw119, executed the
+  restorer's following UD2 and ignored the inner runner's quit. It now honors
+  the restored EIP and stops that handler runner.
+- Upstream's raw CLONE_VM child inherits its creator's native TLS without native
+  CLONE_SETTLS. Updating the child's emulator TLS key therefore changes the
+  parent's key. Parent-directed signal delivery uses the wrong emulator, and
+  cleanup can free the wrong allocation. Separate-PID clone plus delivery and
+  wait now pass with independent initialized host TLS.
+
+The first two are verified integration failures after adding raw signal return.
+The pinned upstream baseline has no raw119 implementation, so this instrument
+cannot establish them as separately reproducible vanilla-upstream signal bugs.
+Treat them as required integration corrections until a baseline-compatible
+reproducer proves otherwise. The TLS mutation is directly present in upstream's
+clone implementation and is a strong independent defect candidate; it is not
+caused by this application's library wrapping choices. The measured trigger is
+pre-NPTL CLONE_VM without CLONE_THREAD or CLONE_SETTLS. Do not claim that this is
+its only possible trigger: inheriting host TLS without CLONE_SETTLS is the
+mechanism, and other unusual clone combinations need separate tests. Typical
+NPTL/wrapped-pthread success does not exercise this separate-PID contract.
+
+The stack/bridge collision is likewise measured with a clean synthetic DSO
+reproducer and the prior translator build. Its new placement correction is
+currently being built/reviewed; a pass-after is still required. No findings are
+filed or published upstream by this checkpoint.
