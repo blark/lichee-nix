@@ -1,0 +1,140 @@
+--- a/src/include/box64context.h
++++ b/src/include/box64context.h
+@@ -221,6 +221,12 @@
+     int                 clean_sz;
+     int                 clean_cap;
+ 
++    // Guest i386 program break; separate from the native libc heap.
++    uintptr_t           brk32_start;
++    uintptr_t           brk32_current;
++    uintptr_t           brk32_mapped;
++    uintptr_t           brk32_data;
++
+     void*               video_mem;
+ 
+     zydis_dec_t         *dec;           // trace
+--- a/src/elfs/elfloader32.c
++++ b/src/elfs/elfloader32.c
+@@ -199,6 +199,21 @@
+     head->image = image;
+     head->raw = raw;
+     head->raw_size = sz;
++    if(mainbin) {
++        // Start beyond the entire ELF reservation, including its alignment tail.
++        context->brk32_start = ((uintptr_t)raw + sz + box64_pagesize - 1) & ~(uintptr_t)(box64_pagesize - 1);
++        context->brk32_current = context->brk32_mapped = context->brk32_start;
++        uintptr_t data_start = 0, data_end = 0;
++        for(size_t i=0; i<head->numPHEntries; ++i) {
++            Elf32_Phdr* ph = &head->PHEntries._32[i];
++            if(ph->p_type != PT_LOAD) continue;
++            if(ph->p_vaddr > data_start) data_start = ph->p_vaddr;
++            if((uintptr_t)ph->p_vaddr + ph->p_filesz > data_end)
++                data_end = (uintptr_t)ph->p_vaddr + ph->p_filesz;
++        }
++        // Match Linux binfmt_elf's initialized data span for RLIMIT_DATA.
++        context->brk32_data = data_end - data_start;
++    }
+     setProtection_elf((uintptr_t)raw, sz, 0);
+ 
+     head->multiblocks = (multiblock_t*)box_calloc(head->multiblock_n, sizeof(multiblock_t));
+--- a/src/emu/x86syscall_32.c
++++ b/src/emu/x86syscall_32.c
+@@ -4,6 +4,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#include <signal.h>
+ #include <sys/syscall.h>   /* For SYS_xxx definitions */
+ #include <unistd.h>
+ #include <time.h>
+@@ -307,6 +308,57 @@
+ }
+ 
+ 
++// Linux's raw brk returns the current break on failure, not -errno.
++// Use guest mappings, never the native libc's process break.
++static uint32_t guest_brk32(x64emu_t* emu, uint32_t requested)
++{
++    box64context_t* ctx = emu->context;
++    // Box64 releases mutex_thread around guest signal handlers. Defer async
++    // signals here so no nested brk can observe a half-completed mapping change.
++    sigset_t block, saved;
++    sigfillset(&block);
++    sigdelset(&block, SIGSEGV);
++    sigdelset(&block, SIGBUS);
++    sigdelset(&block, SIGILL);
++    sigdelset(&block, SIGFPE);
++    sigdelset(&block, SIGTRAP);
++    if(pthread_sigmask(SIG_BLOCK, &block, &saved))
++        return ctx->brk32_current;
++    mutex_lock(&ctx->mutex_thread);
++    uintptr_t current = ctx->brk32_current;
++    uintptr_t page = box64_pagesize;
++    if(!ctx->brk32_start || requested < ctx->brk32_start || requested >= 0xc0000000U)
++        goto done;
++    struct rlimit limit;
++    if(getrlimit(RLIMIT_DATA, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY
++       && (ctx->brk32_data > limit.rlim_cur
++           || requested - ctx->brk32_start > limit.rlim_cur - ctx->brk32_data))
++        goto done;
++    uintptr_t next = ((uintptr_t)requested + page - 1) & ~(page - 1);
++    if(next > ctx->brk32_mapped) {
++        size_t size = next - ctx->brk32_mapped;
++        // MAP_FIXED_NOREPLACE is atomic: never overwrite a library or guest mmap.
++        void* addr = (void*)ctx->brk32_mapped;
++        void* mapped = my32_mmap64(emu, addr, size, PROT_READ|PROT_WRITE,
++            MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE, -1, 0);
++        if(mapped == MAP_FAILED)
++            goto done;
++        if(mapped != addr) {
++            my32_munmap(emu, mapped, size);
++            goto done;
++        }
++    } else if(next < ctx->brk32_mapped) {
++        if(my32_munmap(emu, (void*)next, ctx->brk32_mapped - next))
++            goto done;
++    }
++    ctx->brk32_mapped = next;
++    ctx->brk32_current = current = requested;
++done:
++    mutex_unlock(&ctx->mutex_thread);
++    pthread_sigmask(SIG_SETMASK, &saved, NULL);
++    return current;
++}
++
+ void EXPORT x86Syscall(x64emu_t *emu)
+ {
+     uint32_t s = R_EAX;
+@@ -386,6 +438,9 @@
+                 S_EAX = -errno;
+             break;
+         #endif
++        case 45: // brk
++            R_EAX = guest_brk32(emu, R_EBX);
++            break;
+         case 90:    // old_mmap
+             {
+                 struct mmap_arg_struct *st = from_ptrv(R_EBX);
+@@ -672,6 +727,8 @@
+                 return (uint32_t)syscall(__NR_clone, u32(0), p(4), p(8), p(12), p(16));
+             break;
+ #endif
++        case 45: // brk
++            return guest_brk32(emu, u32(0));
+         case 123:   // SYS_modify_ldt
+             return my_modify_ldt(emu, i32(0), (thread_area_32_t*)p(4), i32(8));
+ #if 0
+--- a/src/box64context.c
++++ b/src/box64context.c
+@@ -306,6 +306,11 @@
+ 
+     box64context_t* ctx = *context;   // local copy to do the cleaning
+ 
++    if(ctx->brk32_mapped > ctx->brk32_start) {
++        box_munmap((void*)ctx->brk32_start, ctx->brk32_mapped - ctx->brk32_start);
++        freeProtection(ctx->brk32_start, ctx->brk32_mapped - ctx->brk32_start);
++    }
++
+     if(ctx->video_mem) {
+         munmap(ctx->video_mem, 0x10000);
+         ctx->video_mem = NULL;

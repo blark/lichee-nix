@@ -1,0 +1,51 @@
+--- a/src/librarian/librarian.c
++++ b/src/librarian/librarian.c
+@@ -444,12 +444,15 @@
+     if(self!=my_context->elfs[0] && (sym = ElfGetWeakSymbolStartEnd(my_context->elfs[0], start, end, name, &version, &vername, 0, &veropt))) {
+         if(elfsym) *elfsym = sym;
+         weak = 1;
++        // BOX32 must keep the first weak provider in lookup order.
++        if(box64_is32bits) return 1;
+     }
+ 
+     if(maplib)
+     for(int i=0; i<maplib->libsz; ++i) {
+         if(self!=GetElf(maplib->libraries[i]) && GetLibWeakSymbolStartEnd(maplib->libraries[i], name, start, end, size, &weak, &version, &vername, 0, &veropt, elfsym)) {
+             weak = 1;
++            if(box64_is32bits) return 1;
+         }
+     }
+ 
+@@ -582,11 +585,14 @@
+     if((sym = ElfGetWeakSymbolStartEnd(my_context->elfs[0], start, end, name, version, vername, (my_context->elfs[0]==self || !self)?1:0, veropt))) {
+         if(elfsym) *elfsym = sym;
+         weak = 1;
++        // BOX32 must keep the first weak provider in lookup order.
++        if(box64_is32bits) return 1;
+     }
+     if(maplib)
+     for(int i=0; i<maplib->libsz; ++i) {
+         if(GetLibWeakSymbolStartEnd(maplib->libraries[i], name, start, end, size, &weak, version, vername, isLocal(self, maplib->libraries[i]), veropt, elfsym)) {
+             weak = 1;
++            if(box64_is32bits) return 1;
+         }
+     }
+     // nope, not found
+@@ -658,12 +664,16 @@
+     if(( sym = ElfGetWeakSymbolStartEnd(my_context->elfs[0], start, end, name, version, vername, (my_context->elfs[0]==self || !self)?1:0, veropt))) {
+         if(elfsym) *elfsym = sym;
+         ok = 1;
++        // BOX32 must keep the first weak provider in lookup order.
++        if(box64_is32bits) return 1;
+     }
+ 
+     if(maplib)
+     for(int i=0; i<maplib->libsz; ++i) {
+-        if(GetLibWeakSymbolStartEnd(maplib->libraries[i], name, start, end, size, &weak, version, vername, isLocal(self, maplib->libraries[i]), veropt, elfsym))
++        if(GetLibWeakSymbolStartEnd(maplib->libraries[i], name, start, end, size, &weak, version, vername, isLocal(self, maplib->libraries[i]), veropt, elfsym)) {
+             ok = 1;
++            if(box64_is32bits) return 1;
++        }
+     }
+     // nope, not found
+     return ok;

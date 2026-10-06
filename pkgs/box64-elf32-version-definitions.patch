@@ -1,0 +1,15 @@
+--- a/src/elfs/elfparser32.c
++++ b/src/elfs/elfparser32.c
+@@ -394,8 +394,10 @@
+ const char* GetSymbolVersion32(elfheader_t* h, int version)
+ {
+     version&=0x7fff;    // remove bit15 that switch between hidden/public
+-    if(!h->VerNeed._32 || (version<2))
+-        return NULL;
++    if(version<2)
++        return NULL;
++    if(!h->VerNeed._32)
++        return GetParentSymbolVersion32(h, version);
+     /*if(version==1)
+         return "*";*/
+     Elf32_Verneed *ver = (Elf32_Verneed*)((uintptr_t)h->VerNeed._32 + h->delta);

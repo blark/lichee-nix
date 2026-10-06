@@ -74,8 +74,16 @@
           sd-image = base.config.system.build.sdImage;
           display-sd-image = display.config.system.build.sdImage;
           firmware = base.config.system.build.licheervNanoFirmware;
+          box64 = import ./pkgs/box64.nix { pkgs = base.pkgs; };
           dosbox = import ./pkgs/dosbox.nix { pkgs = base.pkgs; };
           fastfetch = import ./pkgs/fastfetch.nix { pkgs = base.pkgs; };
+          git = import ./pkgs/git.nix { pkgs = base.pkgs; };
+          inherit (base.pkgs)
+            strace
+            x11vnc
+            xdpyinfo
+            xorg-server
+            ;
           display-kernel = display.config.boot.kernelPackages.kernel;
           display-driver = display.config.system.build.nanoDisplayDriver;
         }

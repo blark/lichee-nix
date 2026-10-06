@@ -37,12 +37,12 @@ pkgs.runCommand "licheerv-nano-board-check"
       fi
     ''}
     test ! -L ${system}/etc/systemd/system/multi-user.target.wants/sshd.service
-    for program in bat dosbox fastfetch htop lsd vis; do
+    for program in bat box64 dosbox fastfetch git htop lsd strace vis Xvfb x11vnc xdpyinfo; do
       test -x ${system}/sw/bin/$program
     done
     grep -q 'snps,dwmac-3.70a.*dwmac_generic' ${config.system.modulesTree}/lib/modules/${kernel.modDirVersion}/modules.alias
     grep -q 'mdio-mux-mmioreg.*mdio_mux_mmioreg' ${config.system.modulesTree}/lib/modules/${kernel.modDirVersion}/modules.alias
-    for driver in usb_f_acm usb_f_serial zram lz4 lzo lzo-rle; do
+    for driver in usb_f_acm usb_f_serial zram lz4 lzo lzo-rle overlay; do
       find ${config.system.modulesTree}/lib/modules -name "$driver.ko*" | grep -q .
     done
     test ! -L ${system}/etc/systemd/system/multi-user.target.wants/nscd.service

@@ -16,6 +16,8 @@ OpenSBI, Sophgo's binary first-stage bootloader, and a minimal NixOS system.
 | Dropbear public-key SSH | Tested; SFTP is not included |
 | Root partition expansion | Tested after correcting kernel configuration |
 | Swap | LZ4 zram plus a 512 MiB SD swap file; tested |
+| Box64 / BOX32 | 32-bit and 64-bit ELF smoke tests passed with RISC-V dynarec |
+| Xvfb / x11vnc | Headless 800×1280 display and VNC connection tested |
 | Experimental MIPI framebuffer | Driver and image build; hardware untested |
 | GT9271 touch | Not implemented yet |
 | Wi-Fi, camera, TPU, auxiliary-core firmware | Not configured |
@@ -135,6 +137,9 @@ vendor `panel=...` selection in `uEnv.txt` does not configure this port.
 
 ```sh
 nix build .#fastfetch
+nix build .#box64
+nix build .#git
+nix build .#xorg-server .#x11vnc .#strace .#xdpyinfo
 nix build .#dosbox
 nix build .#display-driver
 nix build .#display-kernel
@@ -145,7 +150,27 @@ the board. DOSBox 0.74-3 uses software X11 rendering and omits OpenGL and
 hardware audio backends. Its headless x86 execution smoke test passed using
 `scripts/dosbox-smoke.sh`; games, graphics, audio, and performance remain
 untested. The default image includes htop, bat, lsd, vis, Fastfetch, and this DOSBox
-package, so they survive regenerating the SD card.
+package, so they survive regenerating the SD card. Box64 is also included,
+with BOX32 enabled for 32-bit x86 programs and RISC-V dynarec. `SAVE_MEM` is
+disabled because Box64 0.4.4's RISC-V backend lacks its extra jump-table level;
+enabling it crashes dynamically linked programs on this board.
+Invoke either x86-64 or x86 executables explicitly with `box64 PROGRAM`;
+automatic binfmt registration is not configured. Applications may also need
+x86 libraries and corresponding native libraries; this package does not
+provide a complete x86 distribution or Wine environment.
+
+The experimental Box32 patches handle ELF32 version definitions without a
+version-needs table, weak-provider ordering, guest brk and selected startup
+syscalls. Heap and startup/select fixtures pass on the board. Fully emulating
+an old i386 userland still encounters missing signal support; the passing
+fixtures and smoke tests do not establish complete application compatibility.
+See `AUDIT.md` for the measured translator failures. OverlayFS is available
+for temporary chroot roots; the game and its rootfs are not included here.
+
+Xvfb (from Xorg server), x11vnc, strace and xdpyinfo are included for headless
+X11 sessions and debugging. These tools do not start automatically.
+Git's minimal build is included, with HTTPS support. It omits the manual,
+Perl/Python helpers and PCRE2 support to keep the board's closure small.
 
 The display driver must be paired with the display kernel; it cannot be
 loaded into the default kernel, which lacks framebuffer support.

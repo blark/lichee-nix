@@ -27,6 +27,7 @@ let
       "u_serial"
       "configfs"
       "fuse"
+      "overlay"
       "dm_mod"
       "af_packet"
       "ipv6"

@@ -119,6 +119,8 @@ pkgs.linux_7_0.override {
       EXT4_FS = yes;
       EXT4_FS_POSIX_ACL = yes;
       EXT4_FS_SECURITY = yes;
+      # Ruby's chroot keeps the supplied rootfs read-only under a tmpfs overlay.
+      OVERLAY_FS = module;
       FAT_FS = yes;
       VFAT_FS = yes;
       NLS_CODEPAGE_437 = yes;
