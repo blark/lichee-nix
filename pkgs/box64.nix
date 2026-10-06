@@ -19,6 +19,10 @@ pkgs.box64.overrideAttrs (old: {
     ./box64-elf32-brk.patch
     # Raw i386 syscalls used when guest libc is emulated rather than wrapped.
     ./box64-elf32-startup-syscalls.patch
+    # i386 legacy signal frame: build a real frame for non-SA_SIGINFO
+    # handlers and unwind it in sigreturn(119). See
+    # /var/tmp/megatouch/handover/notes/sigframe-implementation-plan.md
+    ./box64-elf32-legacy-sigframe.patch
   ];
   # RV64 libc has no x86 port-permission calls. Match Box64's existing
   # 64-bit iopl wrapper instead of leaving BOX32's weak imports unresolved.

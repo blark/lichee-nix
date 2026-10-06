@@ -1,0 +1,174 @@
+--- a/src/libtools/signal32.c	2026-10-06 09:51:11.939904278 -0400
++++ b/src/libtools/signal32.c	2026-10-06 09:51:40.826740808 -0400
+@@ -258,7 +258,13 @@
+     ptr_t           pretcode;   // pointer to retcode
+     int             sig;
+     i386_mcontext_t cpustate;
+-    struct i386_xstate fpstate;
++    // NOT struct i386_xstate: it carries an xsave header and is
++    // __attribute__((aligned(64))), which pads this member from 96 to 128 and
++    // pushes extramask to 832. The kernel's LEGACY frame has a bare 624-byte
++    // _fpstate at 96 and extramask at 720. Measured: i386_fpstate==624,
++    // i386_xstate==704, __alignof__(i386_xstate)==64. i386_xstate keeps its
++    // alignment because the rt/SA_SIGINFO path needs it.
++    struct i386_fpstate fpstate;
+     ptr_t           extramask[64-1];
+     char            retcode[8];
+ } i386_sigframe_t;
+@@ -333,6 +339,29 @@
+ 
+ x64_stack_t* sigstack_getstack();
+ int my_sigaltstack(x64emu_t* emu, const x64_stack_t* ss, x64_stack_t* oss);
++// Unwind a LEGACY signal frame for sigreturn(119). __restore has already
++// popped the signal number, so ESP is frame+8 and the frame starts 8 below.
++// Offsets verified against the kernel: cpustate 8, FP 96, extramask 720.
++int my32_sigreturn(x64emu_t* emu)
++{
++    i386_sigframe_t* f = (i386_sigframe_t*)from_ptrv(R_ESP - 8);
++    i386_mcontext_t* m = &f->cpustate;
++    R_EAX = m->gregs[I386_EAX]; R_ECX = m->gregs[I386_ECX];
++    R_EDX = m->gregs[I386_EDX]; R_EBX = m->gregs[I386_EBX];
++    R_ESI = m->gregs[I386_ESI]; R_EDI = m->gregs[I386_EDI];
++    R_EBP = m->gregs[I386_EBP]; R_ESP = m->gregs[I386_ESP];
++    emu->eflags.x64 = m->gregs[I386_EFL];
++    R_EIP = m->gregs[I386_EIP];
++    {   // pre-signal mask: oldmask is the low word, extramask[0] the high one
++        sigset_t set;
++        sigemptyset(&set);
++        for(int i=0; i<32; ++i) if(m->oldmask & (1u<<i)) sigaddset(&set, i+1);
++        for(int i=0; i<32; ++i) if(f->extramask[0] & (1u<<i)) sigaddset(&set, i+33);
++        sigprocmask(SIG_SETMASK, &set, NULL);
++    }
++    return R_EAX;
++}
++
+ EXPORT int my32_sigaltstack(x64emu_t* emu, const i386_stack_t* ss, i386_stack_t* oss)
+ {
+     x64_stack_t ss_ = {0};
+@@ -718,7 +747,25 @@
+     if(sig!=X64_SIGSEGV && !(Locks&is_dyndump_locked) && !(Locks&is_memprot_locked))
+         dynarec = BOX64ENV(dynarec_interp_signal)?0:1;
+     #endif
+-    ret = RunFunctionHandler32(&exits, dynarec, sigcontext, my_context->signals[info2->si_signo], 3, info2->si_signo, info2, sigcontext);
++    // LEGACY (non-SA_SIGINFO) path: lay a real frame on the guest stack so that
++    // glibc's __restore ("pop %eax; mov $0x77,%eax; int $0x80") has something to
++    // pop and sigreturn has something to unwind.
++    i386_sigframe_t* sframe = NULL;
++    if(simple) {
++        R_ESP = (R_ESP - sizeof(i386_sigframe_t)) & ~15;
++        sframe = (i386_sigframe_t*)from_ptrv(R_ESP);
++        memset(sframe, 0, sizeof(*sframe));
++        sframe->pretcode = to_ptrv((void*)restorer);
++        sframe->sig = info2->si_signo;
++        sframe->cpustate = sigcontext->uc_mcontext;
++        memcpy(&sframe->fpstate, xstate, sizeof(sframe->fpstate));
++        sframe->cpustate.fpregs = to_ptrv(&sframe->fpstate);
++        sframe->cpustate.oldmask = sigcontext->uc_sigmask.sig[0];
++        sframe->extramask[0] = sigcontext->uc_sigmask.sig[1];
++    }
++    ret = simple
++        ? RunFunctionHandler32(&exits, dynarec, sigcontext, my_context->signals[info2->si_signo], 1, info2->si_signo)
++        : RunFunctionHandler32(&exits, dynarec, sigcontext, my_context->signals[info2->si_signo], 3, info2->si_signo, info2, sigcontext);
+     // restore old value from emu
+     if(used_stack)  // release stack
+         new_ss->ss_flags = 0;
+@@ -815,6 +862,11 @@
+         exit(ret);
+     }
+     if(restorer)
++        if(sframe) {
++            // Enter __restore with ESP at &sframe->sig, so its pop consumes the
++            // signal number and leaves ESP == frame+8 - where sigreturn looks.
++            R_ESP = to_ptrv(&sframe->sig);
++        }
+         RunFunctionHandler32(&exits, 0, NULL, restorer, 0);
+     relockMutex(Locks);
+     return 0;
+@@ -844,7 +896,11 @@
+     void* db = NULL;
+     #endif
+ 
+-    my_sigactionhandler_oldcode_32(emu, sig, 0, info, ucntx, NULL, db);
++    // simple==1 means the guest installed WITHOUT SA_SIGINFO and expects a
++    // one-argument handler over a LEGACY frame. This was hardcoded to 0, so
++    // every 32-bit signal took the SA_SIGINFO path regardless of how the guest
++    // installed it. signals.c:1315 already derives it this way.
++    my_sigactionhandler_oldcode_32(emu, sig, my_context->is_sigaction[sig]?0:1, info, ucntx, NULL, db);
+ }
+ 
+ 
+--- a/src/emu/x86syscall_32.c	2026-10-06 09:51:11.938128255 -0400
++++ b/src/emu/x86syscall_32.c	2026-10-06 10:05:17.241616100 -0400
+@@ -71,6 +71,9 @@
+     //{ 33, __NR_access, 2 },
+     //{ 37, __NR_kill, 2 },
+     //{ 38, __NR_rename, 2 },
++    // NOT enabled: riscv64 has no __NR_mkdir, only mkdirat. Needs a wrapper,
++    // and it is not on the critical path - 17 of the guest's 20 mkdir calls
++    // fail with EEXIST natively anyway.
+     //{ 39, __NR_mkdir, 2 },
+     //{ 40, __NR_rmdir, 1 },
+     //{ 41, __NR_dup, 1 },
+@@ -134,8 +137,13 @@
+     //{ 168, __NR_poll, 3 },    // wrapped to allow SA_RESTART wrapping by libc
+     { 172, __NR_prctl, 5 },
+     //{ 173, __NR_rt_sigreturn, 0 },
+-    //{ 175, __NR_rt_sigprocmask, 4 },
+-    //{ 179, __NR_rt_sigsuspend, 2 },
++    // Passthrough is correct here, unlike sigreturn: these act on the HOST
++    // signal mask, which is what box64 uses to deliver guest signals. And
++    // i386's 2x32-bit sigset is byte-identical to a 64-bit little-endian one,
++    // so the pointer needs no conversion. Without these, glibc falls back to
++    // legacy 126/72 which are also unserved, and the guest spins.
++    { 175, __NR_rt_sigprocmask, 4 },
++    { 179, __NR_rt_sigsuspend, 2 },
+     //{ 183, __NR_getcwd, 2 },
+     //{ 184, __NR_capget, 2},
+     //{ 185, __NR_capset, 2},
+@@ -276,6 +284,8 @@
+ void* my32_mmap64(x64emu_t* emu, void *addr, size_t length, int prot, int flags, int fd, int64_t offset);
+ int my32_munmap(x64emu_t* emu, void* addr, unsigned long length);
+ int my32_sigaltstack(x64emu_t* emu, const i386_stack_t* ss, i386_stack_t* oss);
++int my32_sigreturn(x64emu_t* emu);
++int my32_sigaction(x64emu_t* emu, int signum, const i386_sigaction_t *act, i386_sigaction_t *oldact);
+ int my32_getrlimit(x64emu_t* emu, int resource, uint32_t* limits);
+ int my32_setrlimit(x64emu_t* emu, int resource, uint32_t* limits);
+ 
+@@ -637,6 +647,18 @@
+             }
+             break;
+         }
++        case 119:   // sys_sigreturn - unwind a LEGACY (non-SA_SIGINFO) frame.
++            // THIS is the raw int $0x80 path, which is what glibc 2.2 uses when
++            // libc is emulated. The copy in my32_syscall below serves the libc
++            // syscall() wrapper instead; both are needed.
++            R_EAX = my32_sigreturn(emu);
++            break;
++        case 174:   // sys_rt_sigaction
++            // Absent from this switch entirely; the only copy was in a #if 0
++            // block in my32_syscall. Without it the guest cannot install a
++            // handler, so the whole signal path is unreachable.
++            R_EAX = (uint32_t)my32_sigaction(emu, R_EBX, (i386_sigaction_t*)from_ptrv(R_ECX), (i386_sigaction_t*)from_ptrv(R_EDX));
++            break;
+         case 186:   // sigaltstack
+             S_EAX = my32_sigaltstack(emu, from_ptrv(R_EBX), from_ptrv(R_ECX));
+             if(S_EAX==-1 && errno>0)
+@@ -854,6 +876,18 @@
+         case 174:   // sys_rt_sigaction
+             return (uint32_t)my32_sigaction(emu, i32(0), (x86_sigaction_t*)p(4), (x86_sigaction_t*)p(8));
+ #endif
++        case 119:   // sys_sigreturn - unwind a LEGACY (non-SA_SIGINFO) frame.
++            // Implemented in signal32.c because i386_sigframe_t and the I386_*
++            // greg indices are local to that file. NOT a passthrough: handing a
++            // GUEST frame to the HOST kernel is meaningless, which is why
++            // upstream's commented-out { 119, __NR_sigreturn, 0 } was removed.
++            return my32_sigreturn(emu);
++        case 174:   // sys_rt_sigaction
++            // Lifted OUT of the #if 0 block above, where it had bit-rotted to a
++            // stale type name (x86_sigaction_t) and could not compile. Without
++            // this the guest cannot install a handler at all, so the rest of the
++            // signal path is unreachable and a frame builder alone does nothing.
++            return (uint32_t)my32_sigaction(emu, i32(0), (i386_sigaction_t*)p(4), (i386_sigaction_t*)p(8));
+         case 186:   // sigaltstack
+             return my32_sigaltstack(emu, p(0), p(4));
+         case 192:   // mmap2
