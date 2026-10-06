@@ -654,3 +654,29 @@ uses a no-libc ELF32 DSO with VERDEF and no VERNEED. Box32 runs must select
 the good/bad libraries from distinct working directories with relative
 executable paths; the initial shared-cwd absolute-path check loaded the good
 DSO twice and was rejected. No upstream report has been filed.
+
+### Signal frame instrument saved for continuation
+
+tests/box32-signals now supplies a no-libc native i386 reference. The positive
+probe passes; blocking nested33 deliberately fails1, and removing the119
+restorer's pop deliberately fails139. Current board Box32 fails the positive
+probe at unsupported174, exit1. There is still no signal implementation or
+pass-after. It verifies legacy frame offsets, blocked/pending RT32–34,
+atomic suspend, genuine depth2 nesting, restored integer/flags/x87/XMM state,
+deliberately edited EAX/EBP, and delivery from a separate-PID0xf00 clone.
+The native frame preserves the sole high mask word at offset720 and finds
+the legacy frame at ESP-8 after ret/pop. Initial park/unpark cycles match
+one kill/suspend/return each; deliberate nesting adds a return without a
+second suspend, so the game's147/147/147 reference is workload-specific.
+
+Source details for integration: baseline x86syscall_32.c's wrapped174 case is
+inside #if0; raw174 is absent. RunFunctionHandler32 passes three arguments
+and EmuCall/DynaCall pushes an exit bridge. Building a real frame therefore
+also requires a runner that preserves its restorer return address. Extra
+cdecl arguments alone do not explain the missing frame. Both the inner
+signal32.c and outer signals.c dispatchers restore saved registers;119 must
+bypass stale restoration when the frame is edited. EmuRun saves/restores
+native masks through SigSetJmp(...,1), so its longjmp resume path also needs
+explicit consideration for guest-mask edits. The new native probe exercises
+these observable contracts. Exact implementation remains the next task;
+do not uncomment a native sigreturn passthrough or add fake success.
