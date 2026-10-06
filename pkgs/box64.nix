@@ -33,6 +33,10 @@ pkgs.box64.overrideAttrs (old: {
     ./box64-elf32-clone-tls.patch
     # Descending fixed thread stacks must stay away from low PLT bridges.
     ./box64-elf32-initial-stack.patch
+    # Raw read/write/close returned a libc-style -1, which in the raw syscall
+    # convention IS -EPERM, so a non-blocking socket's EAGAIN reached the guest
+    # as EPERM and Xlib killed the X connection as fatal.
+    ./box64-elf32-raw-errno.patch
   ];
   # RV64 libc has no x86 port-permission calls. Match Box64's existing
   # 64-bit iopl wrapper instead of leaving BOX32's weak imports unresolved.
