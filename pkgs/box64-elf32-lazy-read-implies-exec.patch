@@ -2,94 +2,101 @@ Grant READ_IMPLIES_EXEC lazily, per page, for a 32-bit guest.
 
 Linux sets the READ_IMPLIES_EXEC personality for an i386 ELF with no
 PT_GNU_STACK (fs/binfmt_elf.c), making readable memory executable; pre-NX
-hardware behaved that way regardless.
-
-Megatouch Maxx Ruby has no PT_GNU_STACK and loads each game module into
-malloc'd memory and jumps into it. CheckExec then refuses, synthesising a
-SIGSEGV the guest does not handle:
+hardware behaved that way regardless. Megatouch Maxx Ruby has no PT_GNU_STACK
+and loads each game module into malloc'd memory and jumps into it, so CheckExec
+refuses and synthesises a SIGSEGV the guest does not handle:
 
     Emit Signal 11 at IP=0x9884bb8 / addr=0x9884bb8, code=0xecec
     si_addr=0x9884bb8, TRAPNO=14, ERR=21, prot:3, mmaped:3
     RBX=09884bb8  EIP=09884bb8
 
 0xecec is CheckExec's own marker, so that is Box64's bookkeeping refusing, not
-a hardware fault: prot:3 is RW, and EIP equals EBX because the guest jumped
-through a pointer into its own heap.
+a hardware fault.
 
-Two things are needed, and BOTH were established by failures:
+Granted per page HERE, at the point of execution, not when mappings are
+created. Marking guest mappings executable at mmap time - through my_mmap64 or
+through setProtection_mmap on the result - makes memprot report the whole heap
+as code, so the dynarec's write detection fires on ordinary heap writes; both
+variants crashed the translator with no diagnostic.
 
-1. Grant per page here, not at mmap time. Marking guest mappings executable
-   when created - through my_mmap64, or through setProtection_mmap on the
-   result - makes memprot report the whole heap as code, so the dynarec's
-   self-modifying-code write detection fires on ordinary heap writes. Both
-   variants crashed the translator with no diagnostic, at 116s and 81s.
+PROT_NEVERCLEAN is the right flag and PROT_NOPROT is not, though both look
+equivalent at the write-protection test:
 
-2. Call addDBFromAddressRange with it. my_mmap64 pairs the two whenever a
-   mapping becomes executable, because that function marks existing dynablocks
-   over the range unclean. This game loads and unloads modules at overlapping
-   heap addresses (<<idle>> opened and closed twice, then <<phunt>> opened), so
-   without it the dynarec can execute a stale block translated from the
-   previous module at the same address. Granting protection alone, without
-   this, also crashed the translator.
+  * protectDB skips a page when !(dyn & PROT_NEVERPROT), and PROT_NEVERPROT is
+    (PROT_NOPROT|PROT_NEVERCLEAN), so either flag stops write-protection. That
+    matters because without it the guest's next store into its own module -
+    executed by the INTERPRETER, inside Run() - takes an unhandled store fault:
 
-PROT_NOPROT is required, not decorative. Without it the dynarec write-protects
-the page once it holds translated code (custommem.c removes PROT_WRITE unless
-the page is marked never-protect), and the guest's next store to its own module
-- performed by the interpreter, inside Run() - takes an unhandled store fault:
+        unhandled signal 11 code 0x2 at 0x9800aa4 in box64[d85848,...]
+        cause 0xf (store page fault), SEGV_ACCERR
 
-    unhandled signal 11 code 0x2 at 0x9800aa4 in box64[d85848,34800000+1a4e000]
-    cause 0xf (store page fault), SEGV_ACCERR
+    constant faulting PC, varying guest address, resolving to Run() once you
+    notice box64 is non-PIE with text at 0x34800000. Box64's handler never runs
+    because the PC is its own C code rather than generated code.
 
-The faulting PC is constant across runs while the guest address varies, and it
-resolves to Run(), so the store comes from Box64's own C code rather than from
-generated code - which is why Box64's SIGSEGV handler never ran and the process
-died with no diagnostic at all. These module pages are data AND code, so they
-must not be write-protected. BOX64_DYNAREC_DIRTY=2 and
-BOX64_DYNAREC_NOHOTPAGE=1 were both measured and neither helps: they choose
-which pages get protected, not what happens when the interpreter stores into
-one.
+  * ONLY PROT_NEVERCLEAN sets always_test (dynarec_native.c:518,
+    dynarec_native_pass.c:146), which re-verifies guest code before each
+    execution. This game reloads modules at overlapping heap addresses
+    (<<idle>> opened and closed twice, then <<phunt>>), so without always_test
+    a new module can run the previous one's translation. PROT_NOPROT alone was
+    measured and the game aborted on returning to the menu from a finished
+    game - the exact failure always_test prevents.
 
-Verified against the interpreter: with BOX64_DYNAREC=0 and the grant in place,
-the game reaches its menu, loads Photo Hunt and plays, with zero 0xecec
-emissions - so the grant itself is sound and the dynarec bookkeeping was the
-missing half.
+  * updateProtection keys its skip on PROT_NEVERCLEAN specifically
+    (`never = dyn & PROT_NEVERCLEAN`), so this flag is what that path expects.
 
-Gated on is32bits, so 64-bit guests keep the strict check. The Wine variant in
-os/emit_signal_wine.c is left alone.
+updateProtection, not setProtection: it writes memprot only, leaving the region
+type alone. setProtection would rewrite mapallmem to MEM_ALLOCATED, and
+getMmapped() tests `(flag & MEM_MMAP) == MEM_MMAP`, so a still-mmapped page
+would start reporting false - latent, since the only consumers are
+mallochook.c's allocator dispatch under BOX64_MALLOC_HACK=2, but wrong.
+updateProtection has its addDBFromAddressRange commented out, so this calls it
+explicitly, matching what my_mmap64 does when a mapping becomes executable.
+
+Gated on box64_is32bits, so 64-bit guests keep the strict check. The Wine
+variant in os/emit_signal_wine.c is left alone.
+
+NOT conditioned on PT_GNU_STACK actually being absent: Box64 parses that
+segment for stack size and alignment only (elfloader.c:172) and never records
+its presence, so a general version needs a new elfheader field.
 
 --- a/src/os/emit_signals_linux.c
 +++ b/src/os/emit_signals_linux.c
-@@ -115,6 +115,39 @@
+@@ -114,7 +114,42 @@
+ {
      if (box64_pagesize != 4096)
          return; // disabling the test, 4K pagesize simlation isn't good enough for this
-     while ((getProtection/*_fast*/(addr) & (PROT_EXEC | PROT_READ)) != (PROT_EXEC | PROT_READ)) {
+-    while ((getProtection/*_fast*/(addr) & (PROT_EXEC | PROT_READ)) != (PROT_EXEC | PROT_READ)) {
++    uint32_t prot;
++    while (((prot = getProtection(addr)) & (PROT_EXEC | PROT_READ)) != (PROT_EXEC | PROT_READ)) {
 +        // READ_IMPLIES_EXEC, granted lazily and one page at a time.
 +        //
 +        // Linux sets this personality for an i386 ELF with no PT_GNU_STACK
 +        // (fs/binfmt_elf.c), so readable memory is executable; pre-NX hardware
-+        // behaved that way regardless. Merit's Megatouch Maxx Ruby has no
-+        // PT_GNU_STACK and loads each game module into malloc'd memory, then
-+        // jumps into it - which lands exactly here, with EIP==EBX==heap.
++        // behaved that way regardless. Megatouch Maxx Ruby has no PT_GNU_STACK
++        // and loads each game module into malloc'd memory, then jumps into it -
++        // which lands exactly here, with EIP==EBX==heap.
 +        //
-+        // Per page, at the point of execution, NOT at mmap time. That is
-+        // measured: marking guest mappings executable when they are created -
-+        // via my_mmap64 or via setProtection_mmap - makes the dynarec treat
-+        // every ordinary heap write as self-modifying code, and crashed the
-+        // translator outright with no diagnostic, at 116s and 81s.
++        // PROT_NEVERCLEAN, not PROT_NOPROT. Both make protectDB skip the page
++        // (the test is `!(dyn & PROT_NEVERPROT)`), so either stops the dynarec
++        // write-protecting a page that is data AND code - without which the
++        // guest's next store into its own module, executed by the interpreter
++        // inside Run(), takes an unhandled store fault that kills the process
++        // with no diagnostic. But only PROT_NEVERCLEAN sets always_test
++        // (dynarec_native.c, dynarec_native_pass.c), which re-verifies the
++        // guest code before each execution. Without it a module reloaded at an
++        // overlapping heap address runs the PREVIOUS module's translation.
 +        //
-+        // addDBFromAddressRange is the other half, and omitting it crashed the
-+        // translator too. my_mmap64 pairs the two for any mapping that becomes
-+        // executable (wrapped/wrappedlibc.c: "if(prot & PROT_EXEC)
-+        // addDBFromAddressRange(...)"), because the function marks existing
-+        // dynablocks over the range unclean. This game loads and unloads
-+        // modules at overlapping heap addresses - the log shows <<idle>> opened
-+        // and closed twice before <<phunt>> opened - so without it the dynarec
-+        // can execute a stale block translated from the PREVIOUS module's code
-+        // at the same address.
-+        uint32_t prot = getProtection(addr);
++        // updateProtection, not setProtection: it touches memprot only - its
++        // rb_set(mapallmem, ...) is commented out - so the region type is
++        // preserved. setProtection would rewrite it to MEM_ALLOCATED and make
++        // getMmapped() report false for a page that is still mmapped.
++        // updateProtection also skips addDBFromAddressRange (commented out
++        // there), so this calls it explicitly, as my_mmap64 does for any
++        // mapping that becomes executable.
 +        if (box64_is32bits && (prot & PROT_READ)) {
 +            uintptr_t page = addr & ~(uintptr_t)(box64_pagesize - 1);
-+            setProtection(page, box64_pagesize, prot | PROT_EXEC | PROT_NOPROT);
++            updateProtection(page, box64_pagesize, prot | PROT_EXEC | PROT_NEVERCLEAN);
 +#ifdef DYNAREC
 +            if (BOX64ENV(dynarec))
 +                addDBFromAddressRange(page, box64_pagesize);

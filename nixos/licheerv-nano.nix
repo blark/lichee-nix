@@ -122,13 +122,52 @@ in
     # Dirty file pages that can never be written back is the ramfs signature,
     # and 70,256kB matches the systemd initrd's 70,056kB unpacked by du.
     #
-    # That identification is a HYPOTHESIS, not a mechanism: nixpkgs' own
-    # stage-1-init.sh says "switch_root deletes all files in the ramfs on the
-    # current root", and systemd's switch-root does the same. So the retention
-    # is a BUG with an unidentified cause, not how initramfs works - which
-    # means the ~24MB residual after this change is UNMEASURED until the board
-    # reboots onto it, and chasing the real cause could recover all 63.5MB
-    # rather than 39MB of it.
+    # Why those pages are unevictable rather than merely retained, and why
+    # this setting fixes that too - the part worth understanding before anyone
+    # reverts it. The kernel unpacks the initramfs into rootfs, and
+    # init_rootfs() in init/do_mounts.c:513-521 (linux 7.0.12) makes rootfs
+    # ramfs unless CONFIG_TMPFS is on AND either no root= was given or
+    # rootfstype names tmpfs:
+    #
+    #   if (!saved_root_name[0] && !root_fs_names)                is_tmpfs = true;
+    #   else if (root_fs_names && strstr(root_fs_names, "tmpfs"))  is_tmpfs = true;
+    #
+    # A SYSTEMD initrd puts root= on the cmdline - nixpkgs
+    # nixos/modules/system/boot/systemd/initrd.nix:522,
+    # `lib.optional (config.boot.initrd.systemd.root != null) "root=..."`, whose
+    # default is "fstab". __setup("root=", root_dev_setup) copies that into
+    # saved_root_name, the first branch cannot fire, and rootfs is ramfs. Ramfs
+    # pages can never be written back (fs/ramfs/inode.c calls
+    # mapping_set_unevictable on every inode), so whatever of the initramfs is
+    # never deleted is pinned for the life of the boot. Verified on the running
+    # board: /proc/cmdline, the device tree's /chosen/bootargs and the SD card's
+    # extlinux APPEND line all carry `root=fstab`, and that generation's own
+    # kernel-params in the store reads
+    # "console=ttyS0,115200n8 earlycon root=fstab loglevel=4 lsm=...".
+    #
+    # Turning the systemd initrd off removes root= with it. The built toplevel's
+    # kernel-params for this configuration is
+    # "console=ttyS0,115200n8 earlycon loglevel=4 lsm=landlock,yama,bpf" - no
+    # root= - so the first branch fires and rootfs becomes tmpfs, whose pages
+    # are swap-backed and evictable (tmpfs marks a mapping unevictable only for
+    # `noswap`, which rootfs never sets). The board has 634MB of swap.
+    #
+    # So this setting is expected to do two things: cut the initramfs by 39MB,
+    # and make whatever is still retained reclaimable instead of pinned. An
+    # explicit "rootfstype=tmpfs" kernel parameter would be redundant and was
+    # removed after review - with no root= present the first branch already
+    # fires.
+    #
+    # MEASURED on the board after booting this generation, and it beat the
+    # prediction: Unevictable went to 0 and MemAvailable to 208,152kB, from
+    # 70,256kB unevictable and ~127MB available before. So nothing at all is
+    # retained, not the ~24MB residual predicted from the initrd's unpacked
+    # size - with rootfs as tmpfs the pages are either freed by switch_root or
+    # swappable, and either way they stop being pinned.
+    #
+    # That also settles the mechanism: the retention was never inherent to
+    # initramfs. nixpkgs' stage-1-init.sh says "switch_root deletes all files
+    # in the ramfs on the current root", and dropping root= let that stand.
     #
     # What the scripted initrd does NOT drop: scripted stage-1 copies udevadm
     # and systemd-sysctl into extra-utils, so 8.4MB of systemd 260 survives

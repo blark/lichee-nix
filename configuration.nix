@@ -13,5 +13,9 @@
     # "ssh-ed25519 YOUR_PUBLIC_KEY"
   ];
 
+  # Turn the board's SSH server on here rather than in the exported module, so
+  # importing nixosModules.default never opens a port on someone else's system.
+  services.licheervNano.dropbear.enable = true;
+
   system.stateVersion = "26.05";
 }

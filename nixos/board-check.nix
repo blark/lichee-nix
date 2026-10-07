@@ -60,6 +60,18 @@ pkgs.runCommand "licheerv-nano-board-check"
     grep -q '/swapfile'  ${system}/etc/fstab
     # Inspect the archive itself: a controller driver alone cannot expose
     # the card's block device, and a Nix option assertion would miss that.
+    # A root= on the cmdline makes the kernel pick ramfs over tmpfs for rootfs
+    # (init_rootfs, init/do_mounts.c:513-521), which pins every retained
+    # initramfs page on the unevictable LRU - 70,256kB of 251,108kB measured on
+    # this board. The systemd initrd adds root=fstab via nixpkgs
+    # systemd/initrd.nix:522; nothing should bring it back.
+    # Not "! grep -q": bash exempts a !-inverted command from set -e, so that
+    # spelling can never fail the build.
+    if grep -qE '(^| )root=' ${system}/kernel-params; then
+      echo "root= on the kernel cmdline: rootfs becomes ramfs and the retained" >&2
+      echo "initramfs is pinned unevictable. See licheerv-nano.nix." >&2
+      exit 1
+    fi
     zstd -dc ${initrd}/initrd | cpio -it > initrd-files
     grep -E '(^|/)mmc_block\.ko(\.(xz|zst|gz))?$' initrd-files
     python3 - <<'PY'
