@@ -54,6 +54,7 @@ pkgs.box64.overrideAttrs (old: {
     # where a 32-bit task would get narrowed ones, so the guest sees every
     # directory as empty. Costs seekdir cookies; see the patch header.
     ./box64-elf32-getdents64-cookie.patch
+    ./box64-elf32-lazy-read-implies-exec.patch
   ];
   # RV64 libc has no x86 port-permission calls. Match Box64's existing
   # 64-bit iopl wrapper instead of leaving BOX32's weak imports unresolved.

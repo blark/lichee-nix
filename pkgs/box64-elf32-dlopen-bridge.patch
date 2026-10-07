@@ -66,7 +66,7 @@
          emu->quit = 1;
 --- a/src/wrapped32/wrappedlibdl.c
 +++ b/src/wrapped32/wrappedlibdl.c
-@@ -164,3 +164,96 @@
+@@ -164,3 +164,159 @@
  
  // define all standard library functions
  #include "wrappedlib_init32.h"
@@ -89,7 +89,9 @@
 +//
 +// WHAT IS COVERED: the five _dl_* entry points that libc-2.2.1 DEFINES and
 +// that therefore reach ld.so internals through libc's own PLT -
-+//   _dl_open, _dl_sym, _dl_close, _dl_addr
++//   _dl_open, _dl_sym, _dl_close, _dl_addr,
++//   _dl_lookup_symbol, _dl_lookup_versioned_symbol (defined in ld.so, but
++//   reached because libc's __libc_dlsym calls them directly with the handle)
 +// _dl_vsym is NOT bridged: it takes four pointer arguments and Box64 generates
 +// no four-pointer wrapper (only pFEppp_32). It is reached only through dlvsym,
 +// which this guest never calls.
@@ -106,59 +108,120 @@
 +//   void*            _dl_sym  (void* handle, const char* name, void* who)
 +//   void             _dl_close(void* map)
 +//   int              _dl_addr (const void* address, Dl_info* info)
-+// The caller argument of the lookup functions picks the scope for RTLD_NEXT;
-+// Box64's own dlopen does not use it.
-+EXPORT void* my32__dl_open(x64emu_t* emu, void* file, int mode, void* caller)
++// all internal_function, so those arguments arrive in EAX, EDX, ECX. The
++// caller argument picks the scope for RTLD_NEXT; Box64's dlopen ignores it.
++// These five take their arguments in REGISTERS, not on the stack. glibc marks
++// them `internal_function`, which on i386 is
++// __attribute__((regparm(3), stdcall)): first three args in EAX, EDX, ECX.
++// Verified by disassembling this guest's own libdl.so.2 - dlopen_doit loads
++// eax=file, edx=mode, ecx=caller and calls with NO pushes; dlsym_doit,
++// dlclose_doit and dladdr do the same. Reading the stack instead gets whatever
++// the caller left there: before this was fixed, my_dlopen received ld.so's GOT
++// base as its filename and every module load failed with a garbage name.
++// So each takes only the emu (pFEv/vFEv) and reads the registers itself.
++EXPORT void* my32__dl_open(x64emu_t* emu)
 +{
-+    (void)caller;
-+    return my_dlopen(emu, file, mode);
++    // mode has __RTLD_DLOPEN (0x80000000) OR'd in by the caller; Box64's
++    // dlopen only knows the public RTLD_* bits.
++    return my_dlopen(emu, from_ptrv(R_EAX), (int)(R_EDX & ~0x80000000u));
 +}
 +
-+EXPORT void* my32__dl_sym(x64emu_t* emu, void* handle, void* name, void* who)
++EXPORT void* my32__dl_sym(x64emu_t* emu)
 +{
-+    (void)who;
-+    return my_dlsym(emu, handle, name);
++    return my_dlsym(emu, from_ptrv(R_EAX), from_ptrv(R_EDX));
 +}
 +
-+EXPORT void my32__dl_close(x64emu_t* emu, void* map)
++EXPORT void my32__dl_close(x64emu_t* emu)
 +{
-+    my_dlclose(emu, map);
++    my_dlclose(emu, from_ptrv(R_EAX));
 +}
 +
-+EXPORT int my32__dl_addr(x64emu_t* emu, void* address, void* info)
++EXPORT int my32__dl_addr(x64emu_t* emu)
 +{
-+    return my32_dladdr(emu, address, info);
++    return my32_dladdr(emu, from_ptrv(R_EAX), from_ptrv(R_EDX));
 +}
 +
-+// Called for every symbol name of every ELF32 relocation, so it answers 0 for
-+// everything it does not serve before doing any real work. Bridges are built
-+// once; the unsynchronised lazy init matches upstream's own pltResolver32 idiom
-+// in elfloader32.c, and a concurrent double-build leaks one bridge rather than
-+// returning a wrong one. my_context->system is created in NewBox64Context,
-+// before any ELF is loaded, and is the same bridge the PLT resolver uses.
++// libc's __libc_dlsym does NOT go through _dl_sym: it calls _dl_lookup_symbol
++// itself and passes the dlopen handle as a struct link_map*, which for a
++// Box64-served dlopen is a small index and faults when ld.so dereferences it.
++// Measured chain: __nss_lookup_function -> __libc_dlsym -> _dl_catch_error ->
++// libc's own callback -> _dl_lookup_symbol, dying on 'mov 0x4(%edx),%eax'
++// with edx=6.
++//
++// So serve the lookup too. __libc_dlsym finishes with
++//     result = loadbase + ref->st_value          (libc+0x101e82..0x101e85)
++// and dereferences ref unconditionally, so returning the real address and
++// pointing ref at a PERMANENTLY ZEROED Elf32_Sym gives result == the address.
++// The symbol is shared and never written; nothing in this path modifies it.
++static ptr_t dl_zero_sym32 = 0;
++static ptr_t get_zero_sym32(void)
++{
++    if(!dl_zero_sym32) {
++        // actual_calloc, not box_calloc: this has to be addressable by the
++        // 32-bit guest, which is the same reason the linkmap32 code uses it.
++        void* p = actual_calloc(1, sizeof(Elf32_Sym));
++        if(p) dl_zero_sym32 = to_ptrv(p);
++    }
++    return dl_zero_sym32;
++}
++
++// regparm(3): EAX=undef name, EDX=undef_map (our handle), ECX=ref.
++// The remaining arguments (scope, type_class, and the version for the
++// versioned form) select ld.so's search scope, which Box64's own dlsym
++// replaces wholesale.
++static void* dl_lookup_common32(x64emu_t* emu)
++{
++    ptr_t zero = get_zero_sym32();
++    if(R_ECX && zero)
++        *(ptr_t*)from_ptrv(R_ECX) = zero;
++    if(!zero)
++        return NULL;    // cannot satisfy ref; fail rather than hand back a bad one
++    return my_dlsym(emu, (void*)(uintptr_t)R_EDX, from_ptrv(R_EAX));
++}
++
++EXPORT void* my32__dl_lookup_symbol(x64emu_t* emu)
++{
++    return dl_lookup_common32(emu);
++}
++
++EXPORT void* my32__dl_lookup_versioned_symbol(x64emu_t* emu)
++{
++    return dl_lookup_common32(emu);
++}
++
 +uintptr_t GetEmulatedLoaderBridge32(const char* name)
 +{
-+    static uintptr_t b_open = 0, b_sym = 0, b_close = 0, b_addr = 0;
++    static uintptr_t b_open = 0, b_sym = 0, b_close = 0, b_addr = 0, b_look = 0, b_vlook = 0;
 +    if(!name || name[0]!='_' || name[1]!='d' || name[2]!='l' || name[3]!='_')
 +        return 0;
 +    if(!strcmp(name, "_dl_open")) {
 +        if(!b_open)
-+            b_open = AddBridge(my_context->system, pFEpip_32, my32__dl_open, 0, "_dl_open");
++            b_open = AddBridge(my_context->system, pFEv_32, my32__dl_open, 0, "_dl_open");
 +        return b_open;
 +    }
 +    if(!strcmp(name, "_dl_sym")) {
 +        if(!b_sym)
-+            b_sym = AddBridge(my_context->system, pFEppp_32, my32__dl_sym, 0, "_dl_sym");
++            b_sym = AddBridge(my_context->system, pFEv_32, my32__dl_sym, 0, "_dl_sym");
 +        return b_sym;
 +    }
 +    if(!strcmp(name, "_dl_close")) {
 +        if(!b_close)
-+            b_close = AddBridge(my_context->system, vFEp_32, my32__dl_close, 0, "_dl_close");
++            b_close = AddBridge(my_context->system, vFEv_32, my32__dl_close, 0, "_dl_close");
 +        return b_close;
++    }
++    if(!strcmp(name, "_dl_lookup_symbol")) {
++        if(!b_look)
++            b_look = AddBridge(my_context->system, pFEv_32, my32__dl_lookup_symbol, 0, "_dl_lookup_symbol");
++        return b_look;
++    }
++    if(!strcmp(name, "_dl_lookup_versioned_symbol")) {
++        if(!b_vlook)
++            b_vlook = AddBridge(my_context->system, pFEv_32, my32__dl_lookup_versioned_symbol, 0, "_dl_lookup_versioned_symbol");
++        return b_vlook;
 +    }
 +    if(!strcmp(name, "_dl_addr")) {
 +        if(!b_addr)
-+            b_addr = AddBridge(my_context->system, iFEpp_32, my32__dl_addr, 0, "_dl_addr");
++            b_addr = AddBridge(my_context->system, iFEv_32, my32__dl_addr, 0, "_dl_addr");
 +        return b_addr;
 +    }
 +    return 0;
