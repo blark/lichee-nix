@@ -119,6 +119,34 @@
             config = display.config;
           };
         }
+        // lib.optionalAttrs (host == "x86_64-linux") {
+          # i386 output could be cross-built anywhere, but RUNNING it needs an
+          # x86 builder. Dropping the whole check elsewhere sacrifices its
+          # compile-gate half: fixture compile rot can land from an aarch64
+          # builder unnoticed. Accepted rather than plumbing a second
+          # pkgsCross.gnu32 derivation through eight build.sh scripts that all
+          # assume `cc -m32`, because x86_64 is the builder in practice.
+          #
+          # The fixture tree is passed without the files the build never opens:
+          # fixtures-check.nix itself (its own definition inside its own input
+          # closure), the READMEs, and weak-order's check.sh, which is a
+          # board-side runner comparing two Box64 binaries over the built
+          # fixture directory. Otherwise editing any
+          # comment or README rebuilds all eight fixtures.
+          box32-fixtures = import ./tests/fixtures-check.nix {
+            pkgs = nativePkgs;
+            tests = lib.fileset.toSource {
+              root = ./tests;
+              fileset = lib.fileset.difference ./tests (
+                lib.fileset.unions [
+                  ./tests/fixtures-check.nix
+                  ./tests/box32-weak-order/check.sh
+                  (lib.fileset.fileFilter (file: file.hasExt "md") ./tests)
+                ]
+              );
+            };
+          };
+        }
       );
       formatter = forHosts (host: systems.${host}.nativePkgs.nixfmt);
       devShells = forHosts (

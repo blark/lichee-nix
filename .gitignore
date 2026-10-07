@@ -12,3 +12,9 @@
 *.img
 *.img.zst
 *.log
+
+# box32-ordinary writes probe.dat into whatever directory it is run from and
+# leaves it there; it is sparse and ~4 GiB apparent, which git would store in
+# full. probe.dir is removed on a successful run and survives only a failure.
+probe.dat
+probe.dir/
