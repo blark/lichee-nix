@@ -104,6 +104,54 @@ in
     loader.grub.enable = false;
     loader.generic-extlinux-compatible.enable = true;
     loader.generic-extlinux-compatible.configurationLimit = 3;
+    # MEASURED, by building both initrds and unpacking them from the store:
+    #
+    #   systemd initrd   25,131kB compressed   64,988kB unpacked
+    #   scripted initrd   9,928kB compressed   24,770kB unpacked
+    #
+    # So this saves 40,218kB (39MB) of initramfs. It does NOT save 63.5MB and
+    # it does not stop the retention described below: roughly 24MB of unpacked
+    # initramfs is still written into the same rootfs.
+    #
+    # WHY THAT MATTERS: on the running board, 70,256kB of 251,108kB MemTotal
+    # sits on the unevictable LRU and never comes back. A /proc/kpageflags scan
+    # over all 65,536 DRAM pages found 17,564 unevictable pages, every one
+    # file-backed (zero anonymous), all UPTODATE|DIRTY|LRU, with the count
+    # unchanged to the byte across 'echo 3 > drop_caches' (while Cached fell
+    # 133,316 -> 83,784kB) and across swapoff/swapon, and nr_mlock 0 throughout.
+    # Dirty file pages that can never be written back is the ramfs signature,
+    # and 70,256kB matches the systemd initrd's 70,056kB unpacked by du.
+    #
+    # That identification is a HYPOTHESIS, not a mechanism: nixpkgs' own
+    # stage-1-init.sh says "switch_root deletes all files in the ramfs on the
+    # current root", and systemd's switch-root does the same. So the retention
+    # is a BUG with an unidentified cause, not how initramfs works - which
+    # means the ~24MB residual after this change is UNMEASURED until the board
+    # reboots onto it, and chasing the real cause could recover all 63.5MB
+    # rather than 39MB of it.
+    #
+    # What the scripted initrd does NOT drop: scripted stage-1 copies udevadm
+    # and systemd-sysctl into extra-utils, so 8.4MB of systemd 260 survives
+    # (libsystemd-shared 5,411,496B + libsystemd.so.0 1,935,936B +
+    # libudev.so.1 1,445,856B). The 13MB of systemd in the systemd initrd
+    # becomes 8.4MB, a ~4MB delta, not 13. It also hardcodes lvm and dmsetup
+    # (stage-1.nix copy_bin_and_libs ${getBin pkgs.lvm2}/bin/lvm) and their
+    # libcrypto, so extra-utils keeps patchelf'ed copies totalling 7.2MB that
+    # NO option removes. services.lvm.enable = false leaves the initrd
+    # byte-identical - it changes only the stage-2 closure - so it is not set
+    # here. The saving comes from dropping PID 1, the unit tree, bash,
+    # coreutils, curl, krb5, tpm2-tss and libxml2.
+    #
+    # DEPRECATED ON ARRIVAL: this is the configuration's only warnings entry -
+    # "Scripted initrd is deprecated and scheduled for removal in 26.11", and
+    # the pin IS 26.11 while flake.nix tracks the moving nixos-unstable branch.
+    # When the facility goes, either eval breaks or the board silently reverts
+    # to the 63.5MB systemd initrd. options-check.nix asserts this stays false
+    # so that revert cannot pass the checks unnoticed.
+    #
+    # mkDefault, not a bare literal: this module is exported, and a consumer
+    # wanting LUKS, TPM unlock or repart needs a systemd initrd back.
+    initrd.systemd.enable = lib.mkDefault false;
     # Upstream SD image defaults assume a PC; this board needs only mmc_block.
     initrd.availableKernelModules = lib.mkForce [ ];
     # The host controller is built in, but Nixpkgs builds its block-device

@@ -30,6 +30,12 @@ assert
 assert !(builtins.elem "atkbd" base.config.boot.kernelModules);
 assert builtins.elem "g_serial" base.config.boot.kernelModules;
 assert builtins.elem "extra-test-module" extraModule.boot.kernelModules;
+# A systemd initrd costs this 245MB board 39MB of permanently-held initramfs,
+# measured; licheerv-nano.nix carries the figures. Scripted stage-1 is
+# deprecated upstream with removal targeted at 26.11 and this flake tracks
+# nixos-unstable, so assert the setting rather than let a silent revert to the
+# 64,988kB initrd pass every check in the repo.
+assert !base.config.boot.initrd.systemd.enable;
 assert !withoutKeys.services.licheervNano.dropbear.enable;
 assert withKeys.services.licheervNano.dropbear.enable;
 # Instantiating the consumer's system validates that the exported module
