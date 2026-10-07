@@ -1,0 +1,84 @@
+--- a/src/emu/x86syscall_32.c
++++ b/src/emu/x86syscall_32.c
+@@ -161,7 +161,6 @@
+     //{ 209, __NR_getresuid32, 3 },
+     //{ 210, __NR_setresgid32, 3 },
+     //{ 211, __NR_getresgid32, 3 },
+-    { 220, __NR_getdents64, 3 },
+     //{ 221, __NR_fcntl64, 3 },
+     { 224, __NR_gettid, 0 },
+     //{ 240, __NR_futex, 6 },   // needs wrapping for the optionnal timespec part
+@@ -391,6 +390,65 @@
+     return (minor(dev)&255) | (major(dev)<<8) | ((minor(dev)&~255U)<<12);
+ }
+ 
++// getdents64 for a 32-bit guest: narrow the fields glibc range-checks.
++//
++// A real i386 kernel hands 32-bit tasks 32-bit directory cookies - ext4 tests
++// is_32bit_api() and returns major_hash>>1. Under Box64 the task is 64-bit, so
++// the kernel returns the full 64-bit cookie. glibc's 32-bit readdir() converts
++// dirent64 to dirent and range-checks BOTH d_ino and d_off; when the FIRST
++// entry of a batch does not fit it fails the whole call with EOVERFLOW and the
++// guest sees an empty directory. Measured on an ext4 directory with a hashed
++// index: 45 of 45 entries carried offsets like 0x98cf32315ee7e5b, and the
++// guest's font scan found nothing.
++//
++// Both fields are narrowed, not just d_off, and that is deliberate. glibc's
++// conversion keeps `last_offset` and, on a PARTIAL overflow, lseek()s the
++// directory fd back to that stored cookie and returns a short batch. A
++// narrowed cookie handed back to a 64-bit-api fd is meaningless to ext4
++// (pos2maj_hash gives 0) and the scan would restart or loop. Narrowing every
++// field glibc checks means the overflow branch never runs, so that lseek never
++// happens.
++//
++// WHAT THIS COSTS: telldir/seekdir cookies become meaningless, which is WEAKER
++// than the kernel's own 32-bit path - the kernel's narrowing is coarse but
++// invertible, this is not. Sequential readdir, which is what breaks today, is
++// correct. An application that seekdir()s to a saved cookie is not. Doing it
++// properly would mean narrowing as ext4 does (major>>1) and intercepting
++// llseek on directory fds to re-expand pos<<32.
++static int ordinary_getdents64_32(uint32_t fd, uint32_t buf, uint32_t count)
++{
++    // No pre-validation of the guest buffer: the kernel validates its own
++    // writes, and a spurious EFAULT here is not contained - glibc treats any
++    // -1 that is not EINVAL as "no getdents64" and permanently falls back to
++    // syscall 141, whose handler allocates a guest-sized VLA on the stack.
++    long r = syscall(__NR_getdents64, (int)fd, from_ptrv(buf), count);
++    if(r <= 0 || r > INT32_MAX) return (int)r;
++    int n = (int)r;
++    // struct linux_dirent64: u64 d_ino, s64 d_off, u16 d_reclen, u8 d_type, name[]
++    uint8_t* p = (uint8_t*)from_ptrv(buf);
++    for(int off = 0; off + 19 <= n; ) {
++        uint16_t reclen;
++        memcpy(&reclen, p + off + 16, sizeof(reclen));
++        // filldir64 aligns every record to 8 and the header alone is 19 bytes,
++        // so anything smaller than 24 or unaligned cannot come from Linux.
++        if(reclen < 24 || (reclen & 7) || off + reclen > n) break;
++        uint64_t ino;
++        memcpy(&ino, p + off, sizeof(ino));
++        if(ino > 0xffffffffULL) {
++            ino &= 0xffffffffULL;
++            memcpy(p + off, &ino, sizeof(ino));
++        }
++        int64_t cookie;
++        memcpy(&cookie, p + off + 8, sizeof(cookie));
++        if(cookie != (int64_t)(int32_t)cookie) {
++            int64_t narrowed = (int64_t)(uint32_t)((uint64_t)cookie & 0x7fffffffU);
++            memcpy(p + off + 8, &narrowed, sizeof(narrowed));
++        }
++        off += reclen;
++    }
++    return n;
++}
++
+ static int ordinary_stat32(int call, uint32_t path_or_fd, uint32_t output)
+ {
+     struct stat64 st;
+@@ -635,6 +693,7 @@
+         case 196:   // (no __NR3264_stat), so these are ENOSYS unless served here
+         case 195:
+         case 197: *result=ordinary_stat32(call, a, b); break;
++        case 220: *result=ordinary_getdents64_32(a, b, c); break;
+         case 140: { // high/low offset, result pointer, whence
+             int64_t offset=(int64_t)(((uint64_t)b<<32)|c);
+             off_t r=lseek((int)a, offset, (int)e);

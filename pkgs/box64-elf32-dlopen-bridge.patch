@@ -1,0 +1,165 @@
+--- a/src/elfs/elfloader32.c
++++ b/src/elfs/elfloader32.c
+@@ -33,6 +33,9 @@
+ #include "box64cpu_util.h"
+ #include "wine_tools.h"
+ #include "dictionnary.h"
++
++// in src/wrapped32/wrappedlibdl.c
++uintptr_t GetEmulatedLoaderBridge32(const char* name);
+ #include "symbols.h"
+ #ifdef DYNAREC
+ #include "dynablock.h"
+@@ -519,6 +522,31 @@
+                     GetGlobalSymbolStartEnd(local_maplib, symname, &offs, &end, head, version, vername, veropt, (void**)&elfsym);
+             }
+         }
++        // Take the guest loader's dlopen entry points over to Box64's loader;
++        // the guest ld.so never ran dl_main and crashes if reached. See
++        // GetEmulatedLoaderBridge32 in wrapped32/wrappedlibdl.c for why the
++        // handle can be ours, and for what this does NOT cover.
++        //
++        // This MUST sit after the lookup above, not before it: the STV_PROTECTED
++        // branch and the STB_LOCAL branch both assign offs unconditionally and
++        // would overwrite a pre-set bridge. (It is NOT because libc would
++        // otherwise win the lookup - the global branch is guarded on !offs.)
++        //
++        // Restricted to the three relocation types that take a resolved address
++        // as-is. R_386_COPY in particular must never see it: it memmoves
++        // sym->st_size bytes OUT of offs into the executable's .bss, which for
++        // a bridge would copy translator code into guest data. Unreachable
++        // today - these five symbols are STT_FUNC and COPY is emitted only for
++        // data objects - but bounded here rather than left to that argument.
++        if(t==R_386_JMP_SLOT || t==R_386_GLOB_DAT || t==R_386_32) {
++            uintptr_t loaderbridge = GetEmulatedLoaderBridge32(symname);
++            if(loaderbridge) {
++                printf_log(LOG_DEBUG, "RelocateElfREL32: serving %s from Box64's loader rather than the guest's uninitialised ld.so\n", symname);
++                offs = loaderbridge;
++                end = offs + 1;     // keep offs<end; no consumer reads the size
++                elfsym = NULL;      // not an ifunc, not TLS, has no ELF symbol
++            }
++        }
+         sym_elf = FindElfSymbol(my_context, elfsym);
+         if(elfsym && (ELF32_ST_TYPE(elfsym->st_info)==STT_TLS))
+             offs = elfsym->st_value;
+@@ -938,6 +966,21 @@
+             GetGlobalSymbolStartEnd(local_maplib, symname, &offs, &end, h, version, vername, veropt, (void**)&elfsym);
+     }
+ 
++    // Same override as the eager path. This resolver has its own lookup and is
++    // not reached from RelocateElfREL32, so it needs its own copy - and it is
++    // the one that fires in practice, because libc-2.2.1 defines _dl_open
++    // itself and binds its own GOT slot lazily, at the first call. Every
++    // relocation handled here is an R_386_JMP_SLOT, so no type gate is needed.
++    {
++        uintptr_t loaderbridge = GetEmulatedLoaderBridge32(symname);
++        if(loaderbridge) {
++            printf_log(LOG_DEBUG, "PltResolver32: serving %s from Box64's loader rather than the guest's uninitialised ld.so\n", symname);
++            offs = loaderbridge;
++            end = offs + 1;
++            elfsym = NULL;
++        }
++    }
++
+     if (!offs) {
+         printf_log(LOG_NONE, "Error: PltResolver32: Symbol %s(ver %d: %s%s%s) not found, cannot apply R_386_JMP_SLOT %p (%p) in %s\n", symname, version, symname, vername?"@":"", vername?vername:"", p, from_ptrv(*p), h->name);
+         emu->quit = 1;
+--- a/src/wrapped32/wrappedlibdl.c
++++ b/src/wrapped32/wrappedlibdl.c
+@@ -164,3 +164,96 @@
+ 
+ // define all standard library functions
+ #include "wrappedlib_init32.h"
++
++// THE GUEST'S OWN ld.so CANNOT SERVE dlopen UNDER BOX64.
++//
++// Box64 loads the program and every library itself, so the guest's ld.so is
++// mapped only to satisfy libc's imports - its startup, dl_main, never runs.
++// dl_main is what establishes all of ld.so's global state, so inside the guest
++// loader _dl_loaded is NULL and the search-path structs _dl_init_paths would
++// have built are NULL. Anything reaching it dies. Measured on glibc 2.2.1: the
++// first dlopen's link_map becomes the list head, is freed when that object is
++// unloaded, and the next dlopen walks the reused block into strcmp(name, NULL).
++//
++// So serve the entry points from Box64's loader, which did the real loading.
++// The handle can be ours because it is opaque on the paths measured here:
++// __libc_dlopen returns it without dereferencing it and __libc_dlsym only
++// passes it back. MEASURED, not assumed - but measured only for the
++// __libc_dlopen/__libc_dlsym path this guest takes.
++//
++// WHAT IS COVERED: the five _dl_* entry points that libc-2.2.1 DEFINES and
++// that therefore reach ld.so internals through libc's own PLT -
++//   _dl_open, _dl_sym, _dl_close, _dl_addr
++// _dl_vsym is NOT bridged: it takes four pointer arguments and Box64 generates
++// no four-pointer wrapper (only pFEppp_32). It is reached only through dlvsym,
++// which this guest never calls.
++// WHAT IS NOT: everything the guest imports straight from ld.so, which this
++// hook cannot reach because the definitions are in ld.so itself - notably
++// _dl_catch_error (6 importers in this guest), _dl_lookup_symbol,
++// _dl_map_object, _dl_relocate_object, _dl_loaded. _dl_catch_error sits on the
++// path __libc_dlopen takes and happens to work because a zeroed error buffer
++// is its correct initial state; the rest are only reachable if the guest calls
++// ld.so directly, which this one does not.
++//
++// glibc signatures:
++//   struct link_map* _dl_open (const char* file, int mode, const void* caller)
++//   void*            _dl_sym  (void* handle, const char* name, void* who)
++//   void             _dl_close(void* map)
++//   int              _dl_addr (const void* address, Dl_info* info)
++// The caller argument of the lookup functions picks the scope for RTLD_NEXT;
++// Box64's own dlopen does not use it.
++EXPORT void* my32__dl_open(x64emu_t* emu, void* file, int mode, void* caller)
++{
++    (void)caller;
++    return my_dlopen(emu, file, mode);
++}
++
++EXPORT void* my32__dl_sym(x64emu_t* emu, void* handle, void* name, void* who)
++{
++    (void)who;
++    return my_dlsym(emu, handle, name);
++}
++
++EXPORT void my32__dl_close(x64emu_t* emu, void* map)
++{
++    my_dlclose(emu, map);
++}
++
++EXPORT int my32__dl_addr(x64emu_t* emu, void* address, void* info)
++{
++    return my32_dladdr(emu, address, info);
++}
++
++// Called for every symbol name of every ELF32 relocation, so it answers 0 for
++// everything it does not serve before doing any real work. Bridges are built
++// once; the unsynchronised lazy init matches upstream's own pltResolver32 idiom
++// in elfloader32.c, and a concurrent double-build leaks one bridge rather than
++// returning a wrong one. my_context->system is created in NewBox64Context,
++// before any ELF is loaded, and is the same bridge the PLT resolver uses.
++uintptr_t GetEmulatedLoaderBridge32(const char* name)
++{
++    static uintptr_t b_open = 0, b_sym = 0, b_close = 0, b_addr = 0;
++    if(!name || name[0]!='_' || name[1]!='d' || name[2]!='l' || name[3]!='_')
++        return 0;
++    if(!strcmp(name, "_dl_open")) {
++        if(!b_open)
++            b_open = AddBridge(my_context->system, pFEpip_32, my32__dl_open, 0, "_dl_open");
++        return b_open;
++    }
++    if(!strcmp(name, "_dl_sym")) {
++        if(!b_sym)
++            b_sym = AddBridge(my_context->system, pFEppp_32, my32__dl_sym, 0, "_dl_sym");
++        return b_sym;
++    }
++    if(!strcmp(name, "_dl_close")) {
++        if(!b_close)
++            b_close = AddBridge(my_context->system, vFEp_32, my32__dl_close, 0, "_dl_close");
++        return b_close;
++    }
++    if(!strcmp(name, "_dl_addr")) {
++        if(!b_addr)
++            b_addr = AddBridge(my_context->system, iFEpp_32, my32__dl_addr, 0, "_dl_addr");
++        return b_addr;
++    }
++    return 0;
++}

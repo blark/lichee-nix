@@ -10,8 +10,12 @@ pkgs.box64.overrideAttrs (old: {
   };
   # Old ld-linux has version definitions without a version-needs table.
   # Resolve those definitions instead of passing a null name to strcmp.
-  # ORDER IS LOAD-BEARING: brk, startup-syscalls, legacy-sigframe,
-  # ordinary-syscalls and clone-tls all edit src/emu/x86syscall_32.c.
+  # ORDER IS LOAD-BEARING, because patches share files:
+  #   src/emu/x86syscall_32.c  brk, startup-syscalls, legacy-sigframe,
+  #                            ordinary-syscalls, clone-tls, raw-errno, lstat,
+  #                            getdents64-cookie
+  #   src/elfs/elfloader32.c   brk, dlopen-bridge
+  #   src/include/box64context.h  brk, legacy-sigframe
   # Each patch was generated with its predecessors applied. Append at the end.
   # Verified in this order: zero fuzz and zero offset for every hunk.
   # Flake evaluation alone does not run patchPhase; a real build does.
@@ -37,6 +41,19 @@ pkgs.box64.overrideAttrs (old: {
     # convention IS -EPERM, so a non-blocking socket's EAGAIN reached the guest
     # as EPERM and Xlib killed the X connection as fatal.
     ./box64-elf32-raw-errno.patch
+    # The guest ld.so never runs dl_main, so its own dlopen path has no state
+    # and crashes. Serve _dl_open/_dl_sym/_dl_close from Box64's loader, which
+    # did the real loading; the handle is opaque to the guest.
+    ./box64-elf32-dlopen-bridge.patch
+    # riscv64 defines no path-based stat syscall, so an unserved 107/196 is
+    # ENOSYS and any guest that lstats a path fails - the guest's own /bin/ls
+    # cannot list a directory.
+    ./box64-elf32-lstat.patch
+    # glibc's 32-bit readdir range-checks d_ino and d_off and fails the whole
+    # call with EOVERFLOW; a 64-bit task gets 64-bit cookies from the kernel
+    # where a 32-bit task would get narrowed ones, so the guest sees every
+    # directory as empty. Costs seekdir cookies; see the patch header.
+    ./box64-elf32-getdents64-cookie.patch
   ];
   # RV64 libc has no x86 port-permission calls. Match Box64's existing
   # 64-bit iopl wrapper instead of leaving BOX32's weak imports unresolved.

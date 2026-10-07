@@ -734,7 +734,7 @@ ambiguity. Broad ioctl compatibility remains the existing wrapper's scope.
 
 A bounded game retry cleared those15 warnings but exposed additional raw-path
 gaps. The measured inventory therefore was cross-checked beyond the initial
-list: IDs, link/unlink/rename, mprotect/mremap, nanosleep, writev, getdents64,
+list: IDs, link/unlink/rename, mprotect/mremap, nanosleep, writev,
 fdatasync, mlockall/munlockall, socketcall102 and SysV IPC117 are now dispatched.
 Socketcall covers operations1–15; structure-bearing sendmsg/recvmsg are not
 implemented. IPC covers SHMGET23/SHMAT21/SHMDT22 and structure-free IPC_RMID24;
@@ -844,3 +844,19 @@ The stack/bridge collision is likewise measured with a clean synthetic DSO
 reproducer and the prior translator build. Its new placement correction is
 currently being built/reviewed; a pass-after is still required. No findings are
 filed or published upstream by this checkpoint.
+
+## getdents64 is no longer a straight-through call
+
+`box64-elf32-getdents64-cookie.patch` routes syscall 220 through a helper that
+narrows `d_ino` and `d_off` to 32 bits. glibc's 32-bit `readdir()` range-checks
+both and fails the whole call with `EOVERFLOW`; a 64-bit task gets 64-bit
+cookies from the kernel where a 32-bit task would get narrowed ones, so without
+this the guest sees every directory as empty. Measured on an ext4 directory
+with a hashed index: 45 of 45 entries overflowed under Box64, 0 of 45 natively.
+
+Cost: `telldir`/`seekdir` cookies become meaningless. That is weaker than the
+kernel's own 32-bit narrowing, which is coarse but invertible. Sequential
+`readdir` is correct; an application that seeks to a saved cookie is not.
+Narrowing both fields (not just `d_off`) is deliberate: it keeps glibc's
+partial-overflow branch, which `lseek`s back to a stored cookie, from ever
+running.

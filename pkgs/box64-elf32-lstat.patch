@@ -1,0 +1,27 @@
+--- a/src/emu/x86syscall_32.c
++++ b/src/emu/x86syscall_32.c
+@@ -396,11 +396,12 @@
+     struct stat64 st;
+     // Fetch to native storage first: never copy uninitialized data on failure.
+     int r = call==197 ? fstat64((int)path_or_fd, &st)
+-                      : stat64(from_ptrv(path_or_fd), &st);
++          : (call==107 || call==196) ? lstat64(from_ptrv(path_or_fd), &st)
++                                     : stat64(from_ptrv(path_or_fd), &st);
+     if(r) return r;
+-    size_t size = call==106 ? sizeof(kernel_stat32_t) : sizeof(struct i386_stat64);
++    size_t size = (call==106 || call==107) ? sizeof(kernel_stat32_t) : sizeof(struct i386_stat64);
+     if(!startup_access32(output, size, PROT_WRITE)) { errno=EFAULT; return -1; }
+-    if(call==106) {
++    if(call==106 || call==107) {
+         if(st.st_ino>UINT32_MAX || st.st_nlink>UINT16_MAX || st.st_size>INT32_MAX ||
+            st.st_size<0 || st.st_blocks>UINT32_MAX || major(st.st_dev)>4095 ||
+            major(st.st_rdev)>4095 || minor(st.st_dev)>1048575 || minor(st.st_rdev)>1048575) {
+@@ -630,6 +631,8 @@
+         case 78: *result=ordinary_gettimeofday32(a, b); break;
+         case 85: *result=readlink(from_ptrv(a), from_ptrv(b), c); break;
+         case 106:
++        case 107:   // lstat/lstat64: riscv64 defines no PATH-based stat syscall
++        case 196:   // (no __NR3264_stat), so these are ENOSYS unless served here
+         case 195:
+         case 197: *result=ordinary_stat32(call, a, b); break;
+         case 140: { // high/low offset, result pointer, whence
