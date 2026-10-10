@@ -36,6 +36,21 @@ pkgs.linux_7_0.override {
       name = "nano-audio-dt";
       patch = ../patches/nano-audio-dt.patch;
     }
+    # The DesignWare watchdog. Its restart handler alone does NOT reset this
+    # board (measured: reboot still hung); the vendor kernel gates its reset
+    # behind RTC_EN_WDT_RST_REQ, which this kernel does not set. It returns
+    # after 500 ms and the RTC handler below does the reset (measured; this
+    # OpenSBI 1.8.1 advertises no SBI SRST, so nothing runs ahead of them).
+    {
+      name = "nano-watchdog-dt";
+      patch = ../patches/nano-watchdog-dt.patch;
+    }
+    # Restart through the RTC block (posted upstream, not in 7.0). Run with
+    # reboot=warm (licheerv-nano.nix): the warm request is the vendor kernel's.
+    {
+      name = "rtc-cv1800-restart-handler";
+      patch = ../patches/rtc-cv1800-restart-handler.patch;
+    }
   ]
   ++ lib.optional display {
     name = "nano-framebuffer-dma-helpers";
@@ -229,6 +244,14 @@ pkgs.linux_7_0.override {
       SND_SOC_CV1800B_TDM = yes;
       SND_SOC_CV1800B_DAC_CODEC = yes;
       SND_SIMPLE_CARD = yes;
+      # The watchdog (patches/nano-watchdog-dt.patch); see the patch list above.
+      WATCHDOG = yes;
+      DW_WATCHDOG = yes;
+      # ... and the RTC driver whose restart handler resets the SoC
+      # (patches/rtc-cv1800-restart-handler.patch).
+      RTC_CLASS = yes;
+      SOPHGO_CV1800_RTCSYS = yes;
+      RTC_DRV_CV1800 = yes;
       # No PCI, graphics, Wi-Fi, virtualization, tracing, or debug info.
       PCI = no;
       INPUT = no;

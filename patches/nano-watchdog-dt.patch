@@ -1,0 +1,55 @@
+LicheeRV Nano: the DesignWare watchdog node.
+
+Mainline 7.0.12's cv180x.dtsi has no watchdog node, so dw_wdt never probes.
+With it, dw_wdt registers a restart handler, but that alone does not reset
+the board (measured: reboot still hung at 'reboot: Restarting system'; the
+vendor kernel gates the watchdog reset behind RTC_EN_WDT_RST_REQ). The reset
+itself comes from rtc-cv1800-restart-handler.patch. Node from Sipeed's
+vendor tree (cv181x_base.dtsi: snps,dw-wdt @0x03010000, RST_WDT) and the
+unmerged upstream 'riscv: dts: sophgo: add watchdog dt node for CV1800' (v2).
+
+diff --git a/arch/riscv/boot/dts/sophgo/cv180x.dtsi b/arch/riscv/boot/dts/sophgo/cv180x.dtsi
+index f96b9635b..0329ccfad 100644
+--- a/arch/riscv/boot/dts/sophgo/cv180x.dtsi
++++ b/arch/riscv/boot/dts/sophgo/cv180x.dtsi
+@@ -91,6 +91,24 @@ int_dac: audio-codec@300a000 {
+ 			status = "disabled";
+ 		};
+ 
++		/*
++		 * DesignWare watchdog. Its restart alone did not reset the
++		 * board (measured); the vendor kernel gates the watchdog reset
++		 * behind the RTC's EN_WDT_RST_REQ, so reboot goes through the
++		 * RTC. Address, clock and reset from Sipeed's vendor tree
++		 * (cv181x_base.dtsi: snps,dw-wdt @0x03010000, resets RST_WDT)
++		 * and the unmerged upstream "riscv: dts: sophgo: add watchdog
++		 * dt node for CV1800" (v2); the pre-timeout interrupt is left
++		 * out (unused, number unread).
++		 */
++		watchdog: watchdog@3010000 {
++			compatible = "snps,dw-wdt";
++			reg = <0x3010000 0x100>;
++			clocks = <&clk CLK_APB_WDT>;
++			resets = <&rst RST_WDT>;
++			status = "disabled";
++		};
++
+ 		gpio0: gpio@3020000 {
+ 			compatible = "snps,dw-apb-gpio";
+ 			reg = <0x3020000 0x1000>;
+diff --git a/arch/riscv/boot/dts/sophgo/sg2002-licheerv-nano-b.dts b/arch/riscv/boot/dts/sophgo/sg2002-licheerv-nano-b.dts
+index 1def28a1c..2ce9f5f26 100644
+--- a/arch/riscv/boot/dts/sophgo/sg2002-licheerv-nano-b.dts
++++ b/arch/riscv/boot/dts/sophgo/sg2002-licheerv-nano-b.dts
+@@ -99,6 +99,11 @@ &usb {
+ 	status = "okay";
+ };
+ 
++&watchdog {
++	/* the hardware watchdog; reboot itself goes through the RTC */
++	status = "okay";
++};
++
+ &dmac {
+ 	/* audio DMA: i2s3 requests DMA_I2S3_TX through the dmamux */
+ 	status = "okay";

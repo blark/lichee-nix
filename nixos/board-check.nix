@@ -31,6 +31,8 @@ pkgs.runCommand "licheerv-nano-board-check"
     test "$(fdtget "$dtb" /soc/i2s@4130000 status)" = okay
     test "$(fdtget "$dtb" /soc/audio-codec@300a000 status)" = okay
     fdtget -l "$dtb" / | grep -qx sound
+    # The DesignWare watchdog node (patches/nano-watchdog-dt.patch).
+    test "$(fdtget "$dtb" /soc/watchdog@3010000 status)" = okay
     test -L ${system}/etc/systemd/system/getty.target.wants/serial-getty@ttyGS0.service
     test -L ${system}/etc/systemd/system/multi-user.target.wants/dhcpcd.service
     ${pkgs.lib.optionalString config.services.licheervNano.dropbear.enable ''
@@ -93,11 +95,11 @@ pkgs.runCommand "licheerv-nano-board-check"
         'RISCV_DMA_NONCOHERENT', 'ERRATA_THEAD_CMO', 'ERRATA_THEAD_MAE',
         'USB_DWC2', 'PHY_SOPHGO_CV1800_USB2', 'ZRAM_BACKEND_LZ4',
         'SND_SOC_CV1800B_TDM', 'SND_SOC_CV1800B_DAC_CODEC', 'SND_SIMPLE_CARD',
-        'DW_AXI_DMAC', 'SOPHGO_CV1800B_DMAMUX',
+        'DW_AXI_DMAC', 'SOPHGO_CV1800B_DMAMUX', 'DW_WATCHDOG', 'RTC_DRV_CV1800',
     ]
     for symbol in required:
         assert f'CONFIG_{symbol}=y\n' in kernel_config, symbol
-    for symbol in ['SMP', 'MEM_ALLOC_PROFILING', 'PCI', 'DRM']:
+    for symbol in ['SMP', 'MEM_ALLOC_PROFILING', 'PCI', 'DRM', 'WATCHDOG_NOWAYOUT']:
         assert f'CONFIG_{symbol}=y\n' not in kernel_config, symbol
     assert Path('${kernel}/Image').stat().st_size < 16 * 1024 * 1024
     assert Path('${kernel}/Image').stat().st_size < 0x85000000 - 0x80200000

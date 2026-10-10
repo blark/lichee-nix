@@ -1,0 +1,118 @@
+From: Alexander Sverdlin <alexander.sverdlin@gmail.com>
+Date: Thu, 13 Feb 2025 22:57:39 +0100
+Subject: [PATCH v11 3/3] rtc: sophgo: cv18xx: Add restart handler
+
+Currently provided ATF firmware for ARM64 Sophgo SoCs is binary-only.
+To make Linux independent from this binary firmware, provide restart
+handler triggering COLD or WARM reboot directly via RTC HW block as
+alternative to PSCI interface.
+
+Handler priority SYS_OFF_PRIO_DEFAULT of 0 is desired, because if PSCI
+is indeed present, its priority of 129 will override the new one. On RiskV
+side the behaviour is unchanged as well because SBI SRST handler has higher
+priority as well (192).
+
+Tested on SG2000 in ARM64 mode.
+
+Signed-off-by: Alexander Sverdlin <alexander.sverdlin@gmail.com>
+---
+lichee-nix backport notes (not part of the upstream message):
+- Source: https://lkml.iu.edu/hypermail/linux/kernel/2502.1/08913.html. Not in
+  7.0.12. The RTC maintainer objected to v11's probe tail ("Probe must never
+  fail after devm_rtc_register_device", lkml 2502.1/09016), so this backport
+  registers the restart handler BEFORE devm_rtc_register_device and returns
+  that call unchanged. The restart handler itself is the posting's, verbatim.
+- Sipeed's vendor kernel (LicheeRV-Nano-Build linux_5.10
+  drivers/power/reset/cvi-reboot.c) resets through the same RTC block but
+  always with the WARM request, so lichee-nix boots with reboot=warm.
+- Measured on the LicheeRV Nano (2026-10-10): the SoC resets and U-Boot runs
+  after both warm and cold requests.
+
+diff --git a/drivers/rtc/rtc-cv1800.c b/drivers/rtc/rtc-cv1800.c
+index 678c2c10b..a5e1773b0 100644
+--- a/drivers/rtc/rtc-cv1800.c
++++ b/drivers/rtc/rtc-cv1800.c
+@@ -10,17 +10,23 @@
+ #include <linux/kernel.h>
+ #include <linux/mfd/syscon.h>
+ #include <linux/module.h>
++#include <linux/notifier.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/reboot.h>
+ #include <linux/regmap.h>
+ #include <linux/rtc.h>
+ 
++#define CTRL_UNLOCKKEY         0x0004
++#define CTRL0                  0x0008
+ #define SEC_PULSE_GEN          0x1004
+ #define ALARM_TIME             0x1008
+ #define ALARM_ENABLE           0x100C
+ #define SET_SEC_CNTR_VAL       0x1010
+ #define SET_SEC_CNTR_TRIG      0x1014
+ #define SEC_CNTR_VAL           0x1018
++#define EN_PWR_CYC_REQ         0x10C8
++#define EN_WARM_RST_REQ        0x10CC
+ 
+ /*
+  * When in VDDBKUP domain, this MACRO register
+@@ -29,6 +35,10 @@
+ #define MACRO_RO_T             0x14A8
+ #define MACRO_RG_SET_T         0x1498
+ 
++/* CTRL0 bits */
++#define REQ_PWR_CYC            BIT(3)
++#define REQ_WARM_RST           BIT(4)
++
+ #define ALARM_ENABLE_MASK      BIT(0)
+ #define SEL_SEC_PULSE          BIT(31)
+ 
+@@ -155,6 +165,29 @@ static const struct rtc_class_ops cv1800_rtc_ops = {
+ 	.alarm_irq_enable = cv1800_rtc_alarm_irq_enable,
+ };
+ 
++static int cv1800_restart_handler(struct sys_off_data *data)
++{
++	struct cv1800_rtc_priv *info = data->cb_data;
++	u32 reg_en = EN_WARM_RST_REQ;
++	u32 request = 0xFFFF0800;
++
++	if (data->mode == REBOOT_COLD) {
++		reg_en = EN_PWR_CYC_REQ;
++		request |= REQ_PWR_CYC;
++	} else {
++		request |= REQ_WARM_RST;
++	}
++
++	/* Enable reset request */
++	regmap_write(info->rtc_map, reg_en, 1);
++	/* Enable CTRL0 register access */
++	regmap_write(info->rtc_map, CTRL_UNLOCKKEY, 0xAB18);
++	/* Request reset */
++	regmap_write(info->rtc_map, CTRL0, request);
++
++	return NOTIFY_DONE;
++}
++
+ static int cv1800_rtc_probe(struct platform_device *pdev)
+ {
+ 	struct cv1800_rtc_priv *rtc;
+@@ -195,6 +228,18 @@ static int cv1800_rtc_probe(struct platform_device *pdev)
+ 		return dev_err_probe(&pdev->dev, ret,
+ 				     "cannot register interrupt handler\n");
+ 
++	/*
++	 * SYS_OFF_PRIO_DEFAULT of 0 is desired here because both RiscV SBI SRST
++	 * (prio 192) and ARM PSCI (prio 129) will override this one; this
++	 * handler shall serve as a fallback in cases where firmware is not
++	 * present.
++	 */
++	ret = devm_register_restart_handler(&pdev->dev, cv1800_restart_handler,
++					    rtc);
++	if (ret)
++		return dev_err_probe(&pdev->dev, ret,
++				     "cannot register restart handler\n");
++
+ 	return devm_rtc_register_device(rtc->rtc_dev);
+ }
+ 

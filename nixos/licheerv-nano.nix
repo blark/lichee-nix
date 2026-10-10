@@ -100,6 +100,10 @@ in
     kernelParams = [
       "console=ttyS0,115200n8"
       "earlycon"
+      # Reboot through the RTC's WARM reset request, as Sipeed's vendor kernel
+      # does (cvi-reboot.c); RISC-V otherwise defaults to REBOOT_COLD, which
+      # takes the RTC driver's power-cycle path.
+      "reboot=warm"
     ];
     loader.grub.enable = false;
     loader.generic-extlinux-compatible.enable = true;
