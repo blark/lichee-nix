@@ -1,0 +1,95 @@
+LicheeRV Nano: I2S3 + internal DAC + simple-audio-card (sound out).
+
+diff --git a/arch/riscv/boot/dts/sophgo/cv180x.dtsi b/arch/riscv/boot/dts/sophgo/cv180x.dtsi
+index 06b0ce5a2..f96b9635b 100644
+--- a/arch/riscv/boot/dts/sophgo/cv180x.dtsi
++++ b/arch/riscv/boot/dts/sophgo/cv180x.dtsi
+@@ -84,6 +84,13 @@ external_mdio: mdio@80 {
+ 			};
+ 		};
+ 
++		int_dac: audio-codec@300a000 {
++			compatible = "sophgo,cv1800b-sound-dac";
++			reg = <0x0300a000 0x100>;
++			#sound-dai-cells = <0>;
++			status = "disabled";
++		};
++
+ 		gpio0: gpio@3020000 {
+ 			compatible = "snps,dw-apb-gpio";
+ 			reg = <0x3020000 0x1000>;
+@@ -288,6 +295,25 @@ gmac0_stmmac_axi_setup: stmmac-axi-config {
+ 			};
+ 		};
+ 
++		/*
++		 * Audio, from the upstream series "ASoC: sophgo: add CV1800 I2S/TDM"
++		 * (v4, riscv: dts: sophgo: dts nodes for i2s tdm modules): I2S3 and
++		 * the internal DAC. DMA request 7 is DMA_I2S3_TX (cv180x-dmamux.h in
++		 * that series), routed to C906 core 0 (DMA_CPU_C906_0 = 1). The
++		 * vendor tree (LicheeRV-Nano-Build cv181x_base.dtsi) wires I2S3 to
++		 * the internal DAC as TX, on dmac 7, with I2S3 driving MCLK.
++		 */
++		i2s3: i2s@4130000 {
++			compatible = "sophgo,cv1800b-i2s";
++			reg = <0x04130000 0x1000>;
++			clocks = <&clk CLK_APB_I2S3>, <&clk CLK_SDMA_AUD3>;
++			clock-names = "i2s", "mclk";
++			dmas = <&dmamux 7 1>;
++			dma-names = "tx";
++			#sound-dai-cells = <0>;
++			status = "disabled";
++		};
++
+ 		uart0: serial@4140000 {
+ 			compatible = "snps,dw-apb-uart";
+ 			reg = <0x04140000 0x100>;
+@@ -417,7 +443,7 @@ sdhci1: mmc@4320000 {
+ 		};
+ 
+ 		dmac: dma-controller@4330000 {
+-			compatible = "snps,axi-dma-1.01a";
++			compatible = "sophgo,cv1800b-axi-dma";
+ 			reg = <0x04330000 0x1000>;
+ 			interrupts = <SOC_PERIPHERAL_IRQ(13) IRQ_TYPE_LEVEL_HIGH>;
+ 			clocks = <&clk CLK_SDMA_AXI>, <&clk CLK_SDMA_AXI>;
+diff --git a/arch/riscv/boot/dts/sophgo/sg2002-licheerv-nano-b.dts b/arch/riscv/boot/dts/sophgo/sg2002-licheerv-nano-b.dts
+index b1853770d..1def28a1c 100644
+--- a/arch/riscv/boot/dts/sophgo/sg2002-licheerv-nano-b.dts
++++ b/arch/riscv/boot/dts/sophgo/sg2002-licheerv-nano-b.dts
+@@ -98,3 +98,35 @@ &usb {
+ 	dr_mode = "host";
+ 	status = "okay";
+ };
++
++&dmac {
++	/* audio DMA: i2s3 requests DMA_I2S3_TX through the dmamux */
++	status = "okay";
++};
++
++&i2s3 {
++	status = "okay";
++};
++
++&int_dac {
++	status = "okay";
++};
++
++/ {
++	sound {
++		compatible = "simple-audio-card";
++		simple-audio-card,name = "sg2002-dac";
++		simple-audio-card,format = "i2s";
++		/* I2S3 drives the clocks to the internal DAC (vendor: mclk_out). */
++		simple-audio-card,bitclock-master = <&cpu_dai>;
++		simple-audio-card,frame-master = <&cpu_dai>;
++
++		cpu_dai: simple-audio-card,cpu {
++			sound-dai = <&i2s3>;
++		};
++
++		simple-audio-card,codec {
++			sound-dai = <&int_dac>;
++		};
++	};
++};

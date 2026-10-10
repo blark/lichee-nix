@@ -22,6 +22,20 @@ pkgs.linux_7_0.override {
   kernelPatches = [
     pkgs.kernelPatches.bridge_stp_helper
     pkgs.kernelPatches.request_key_helper
+    # Sound out: the CV1800B DMA support from mainline (applied upstream
+    # after 7.0), then I2S3 + the internal DAC + a simple-audio-card.
+    {
+      name = "upstream-dt-bindings-cv1800b-axi-dma";
+      patch = ../patches/upstream-dt-bindings-cv1800b-axi-dma.patch;
+    }
+    {
+      name = "upstream-dw-axi-dmac-cv1800b";
+      patch = ../patches/upstream-dw-axi-dmac-cv1800b.patch;
+    }
+    {
+      name = "nano-audio-dt";
+      patch = ../patches/nano-audio-dt.patch;
+    }
   ]
   ++ lib.optional display {
     name = "nano-framebuffer-dma-helpers";
@@ -203,12 +217,23 @@ pkgs.linux_7_0.override {
       USB_F_ACM = module;
       USB_F_SERIAL = module;
       USB_U_SERIAL = module;
-      # No PCI, graphics, audio, Wi-Fi, virtualization, tracing, or debug info.
+      # Audio out through the SoC's internal DAC: the AXI DMA controller and
+      # its request mux, ALSA/ASoC, the CV1800B I2S/TDM and DAC drivers, and
+      # simple-audio-card (the card is in patches/nano-audio-dt.patch).
+      DMADEVICES = yes;
+      DW_AXI_DMAC = yes;
+      SOPHGO_CV1800B_DMAMUX = yes;
+      SOUND = yes;
+      SND = yes;
+      SND_SOC = yes;
+      SND_SOC_CV1800B_TDM = yes;
+      SND_SOC_CV1800B_DAC_CODEC = yes;
+      SND_SIMPLE_CARD = yes;
+      # No PCI, graphics, Wi-Fi, virtualization, tracing, or debug info.
       PCI = no;
       INPUT = no;
       VT = no;
       DRM = no;
-      SOUND = no;
       WLAN = no;
       WIRELESS = no;
       VIRTUALIZATION = no;

@@ -24,6 +24,13 @@ pkgs.runCommand "licheerv-nano-board-check"
     test "$(fdtget "$dtb" /soc/usb@4340000 status)" = okay
     test "$(fdtget "$dtb" /soc/mmc@4310000 status)" = okay
     test "$(fdtget "$dtb" /soc/serial@4140000 status)" = okay
+    # Audio out: the AXI DMA controller (cv1800b compatible, so the dmamux can
+    # route to it), I2S3 and the internal DAC enabled, and the sound card.
+    test "$(fdtget "$dtb" /soc/dma-controller@4330000 status)" = okay
+    test "$(fdtget "$dtb" /soc/dma-controller@4330000 compatible)" = sophgo,cv1800b-axi-dma
+    test "$(fdtget "$dtb" /soc/i2s@4130000 status)" = okay
+    test "$(fdtget "$dtb" /soc/audio-codec@300a000 status)" = okay
+    fdtget -l "$dtb" / | grep -qx sound
     test -L ${system}/etc/systemd/system/getty.target.wants/serial-getty@ttyGS0.service
     test -L ${system}/etc/systemd/system/multi-user.target.wants/dhcpcd.service
     ${pkgs.lib.optionalString config.services.licheervNano.dropbear.enable ''
@@ -85,10 +92,12 @@ pkgs.runCommand "licheerv-nano-board-check"
         'EXT4_FS', 'BLK_DEV_WRITE_MOUNTED', 'MMC_SDHCI_OF_DWCMSHC', 'SERIAL_8250_CONSOLE',
         'RISCV_DMA_NONCOHERENT', 'ERRATA_THEAD_CMO', 'ERRATA_THEAD_MAE',
         'USB_DWC2', 'PHY_SOPHGO_CV1800_USB2', 'ZRAM_BACKEND_LZ4',
+        'SND_SOC_CV1800B_TDM', 'SND_SOC_CV1800B_DAC_CODEC', 'SND_SIMPLE_CARD',
+        'DW_AXI_DMAC', 'SOPHGO_CV1800B_DMAMUX',
     ]
     for symbol in required:
         assert f'CONFIG_{symbol}=y\n' in kernel_config, symbol
-    for symbol in ['SMP', 'MEM_ALLOC_PROFILING', 'PCI', 'DRM', 'SOUND']:
+    for symbol in ['SMP', 'MEM_ALLOC_PROFILING', 'PCI', 'DRM']:
         assert f'CONFIG_{symbol}=y\n' not in kernel_config, symbol
     assert Path('${kernel}/Image').stat().st_size < 16 * 1024 * 1024
     assert Path('${kernel}/Image').stat().st_size < 0x85000000 - 0x80200000

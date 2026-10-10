@@ -1,0 +1,29 @@
+From 5eda5f42d2fee87127b568206a9fcc07a2f6eab6 Mon Sep 17 00:00:00 2001
+From: Inochi Amaoto <inochiama@gmail.com>
+Date: Tue, 20 Jan 2026 09:37:03 +0800
+Subject: [PATCH] dt-bindings: dma: snps,dw-axi-dmac: Add CV1800B compatible
+
+The DMA controller on CV1800B needs to use the DMA phandle args
+as the channel number instead of hardware handshake number, so
+add a new compatible for the DMA controller on CV1800B.
+
+Signed-off-by: Inochi Amaoto <inochiama@gmail.com>
+Acked-by: Conor Dooley <conor.dooley@microchip.com>
+Link: https://patch.msgid.link/20260120013706.436742-2-inochiama@gmail.com
+Signed-off-by: Vinod Koul <vkoul@kernel.org>
+---
+ Documentation/devicetree/bindings/dma/snps,dw-axi-dmac.yaml | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/Documentation/devicetree/bindings/dma/snps,dw-axi-dmac.yaml b/Documentation/devicetree/bindings/dma/snps,dw-axi-dmac.yaml
+index e12a48a12ea458..804514732dbe65 100644
+--- a/Documentation/devicetree/bindings/dma/snps,dw-axi-dmac.yaml
++++ b/Documentation/devicetree/bindings/dma/snps,dw-axi-dmac.yaml
+@@ -21,6 +21,7 @@ properties:
+       - enum:
+           - snps,axi-dma-1.01a
+           - intel,kmb-axi-dma
++          - sophgo,cv1800b-axi-dma
+           - starfive,jh7110-axi-dma
+           - starfive,jh8100-axi-dma
+       - items:
